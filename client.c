@@ -26,7 +26,7 @@ static void client_restore_terminal(void) {
 		return;
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
 	if (alternate_buffer) {
-		printf("\033[?25h\033[?1049l");
+		printf("\033[?25h");
 		fflush(stdout);
 		alternate_buffer = false;
 	}
@@ -49,7 +49,8 @@ static void client_setup_terminal(void) {
 	tcsetattr(STDIN_FILENO, TCSANOW, &cur_term);
 
 	if (!alternate_buffer) {
-		printf("\033[?1049h\033[H");
+		/* Keep the client in the main screen so terminal scrollback remains usable. */
+		printf("\033[H");
 		fflush(stdout);
 		alternate_buffer = true;
 	}

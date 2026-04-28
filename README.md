@@ -1,4 +1,56 @@
-# abduco a tool for session {at,de}tach support
+# abduco-inline
+
+`abduco-inline` is a tiny fork of
+[abduco](https://www.brain-dump.org/projects/abduco) for long-running terminal
+agents and TUIs that should keep using the terminal's native scrollback by
+default.
+
+The upstream `abduco` client enters the terminal alternate screen when attaching
+to a session. That is useful for full-screen applications, but it prevents the
+main terminal scrollback from behaving like a normal shell. This fork keeps the
+abduco client on the main screen while preserving abduco's core behavior: start
+a process, detach, and reattach later.
+
+Important boundary: `abduco-inline` only changes what the **abduco client** does
+while attaching. It does not block, filter, or rewrite terminal control
+sequences from the application running inside the session. If the child
+application chooses to enter a fullscreen/alternate-screen mode, it still can.
+For example, Claude Code's normal inline mode can use native terminal
+scrollback, while Claude Code's `/tui fullscreen` mode can still switch to its
+own fullscreen UI.
+
+Typical agent usage:
+
+```sh
+abduco -A my-agent codex --no-alt-screen
+abduco -A my-agent
+```
+
+For Claude Code:
+
+```sh
+abduco -A my-claude claude
+abduco -A my-claude
+```
+
+When the wrapped application also has an alternate-screen option, disable it
+there as well. For Codex that means `codex --no-alt-screen`.
+
+When the wrapped application intentionally enters fullscreen mode, scrollback
+behavior is owned by that application until it exits fullscreen mode.
+
+## What changed
+
+This fork removes the client-side `CSI ? 1049 h/l` alternate-screen enter/leave
+sequences from abduco's attach path. It still switches the terminal to raw mode
+while attached, forwards input/output through the session pty, and restores the
+terminal settings on detach.
+
+Everything else is upstream abduco.
+
+---
+
+# upstream abduco
 
 [abduco](https://www.brain-dump.org/projects/abduco) provides
 session management i.e. it allows programs to be run independently
