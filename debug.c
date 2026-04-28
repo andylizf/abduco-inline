@@ -18,6 +18,9 @@ static void print_packet(const char *prefix, Packet *pkt) {
 		[MSG_RESIZE]  = "RESIZE",
 		[MSG_EXIT]    = "EXIT",
 		[MSG_PID]     = "PID",
+		[MSG_DUMP]    = "DUMP",
+		[MSG_DUMP_END] = "DUMP_END",
+		[MSG_SEND_KEYS] = "SEND_KEYS",
 	};
 	const char *type = "UNKNOWN";
 	if (pkt->type < countof(msgtype) && msgtype[pkt->type])

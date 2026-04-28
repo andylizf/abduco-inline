@@ -75,12 +75,35 @@ static int server_set_socket_non_blocking(int sock) {
     	return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
 
+static void server_history_append(const char *buf, size_t len) {
+	if (len >= HISTORY_CAP) {
+		memcpy(server.history, buf + len - HISTORY_CAP, HISTORY_CAP);
+		server.history_start = 0;
+		server.history_len = HISTORY_CAP;
+		return;
+	}
+
+	size_t overflow = server.history_len + len > HISTORY_CAP ?
+		server.history_len + len - HISTORY_CAP : 0;
+	server.history_start = (server.history_start + overflow) % HISTORY_CAP;
+	server.history_len -= overflow;
+
+	size_t end = (server.history_start + server.history_len) % HISTORY_CAP;
+	size_t first = HISTORY_CAP - end;
+	if (first > len)
+		first = len;
+	memcpy(server.history + end, buf, first);
+	memcpy(server.history, buf + first, len - first);
+	server.history_len += len;
+}
+
 static bool server_read_pty(Packet *pkt) {
 	pkt->type = MSG_CONTENT;
 	ssize_t len = read(server.pty, pkt->u.msg, sizeof(pkt->u.msg));
-	if (len > 0)
+	if (len > 0) {
 		pkt->len = len;
-	else if (len == 0)
+		server_history_append(pkt->u.msg, pkt->len);
+	} else if (len == 0)
 		server.running = false;
 	else if (len == -1 && errno != EAGAIN && errno != EINTR && errno != EWOULDBLOCK)
 		server.running = false;
@@ -115,6 +138,29 @@ static bool server_send_packet(Client *c, Packet *pkt) {
 	debug("FAILED\n");
 	c->state = STATE_DISCONNECTED;
 	return false;
+}
+
+static bool server_send_history(Client *c) {
+	size_t remaining = server.history_len;
+	size_t pos = server.history_start;
+
+	while (remaining > 0) {
+		Packet pkt = { .type = MSG_CONTENT };
+		size_t chunk = HISTORY_CAP - pos;
+		if (chunk > remaining)
+			chunk = remaining;
+		if (chunk > sizeof(pkt.u.msg))
+			chunk = sizeof(pkt.u.msg);
+		memcpy(pkt.u.msg, server.history + pos, chunk);
+		pkt.len = chunk;
+		if (!server_send_packet(c, &pkt))
+			return false;
+		pos = (pos + chunk) % HISTORY_CAP;
+		remaining -= chunk;
+	}
+
+	Packet end = { .type = MSG_DUMP_END };
+	return server_send_packet(c, &end);
 }
 
 static void server_pty_died_handler(int sig) {
@@ -226,6 +272,13 @@ static void server_mainloop(void) {
 					c->flags = client_packet.u.i;
 					if (c->flags & CLIENT_LOWPRIORITY)
 						server_sink_client();
+					break;
+				case MSG_DUMP:
+					server_send_history(c);
+					c->state = STATE_DISCONNECTED;
+					break;
+				case MSG_SEND_KEYS:
+					server_write_pty(&client_packet);
 					break;
 				case MSG_RESIZE:
 					c->state = STATE_ATTACHED;

@@ -21,6 +21,78 @@ static bool client_recv_packet(Packet *pkt) {
 	return false;
 }
 
+static bool client_expect_pid(void) {
+	Packet pkt;
+	return client_recv_packet(&pkt) && pkt.type == MSG_PID;
+}
+
+static bool dump_session(const char *name) {
+	if (server.socket > 0)
+		close(server.socket);
+	if ((server.socket = session_connect(name)) == -1)
+		return false;
+	if (!client_expect_pid())
+		goto error;
+
+	Packet pkt = { .type = MSG_DUMP };
+	if (!client_send_packet(&pkt))
+		goto error;
+
+	while (client_recv_packet(&pkt)) {
+		switch (pkt.type) {
+		case MSG_CONTENT:
+			if (write_all(STDOUT_FILENO, pkt.u.msg, pkt.len) != pkt.len)
+				goto error;
+			break;
+		case MSG_DUMP_END:
+			close(server.socket);
+			server.socket = -1;
+			return true;
+		default:
+			break;
+		}
+	}
+
+error:
+	if (server.socket > 0) {
+		close(server.socket);
+		server.socket = -1;
+	}
+	return false;
+}
+
+static bool send_keys_session(const char *name, const char *keys) {
+	if (server.socket > 0)
+		close(server.socket);
+	if ((server.socket = session_connect(name)) == -1)
+		return false;
+	if (!client_expect_pid())
+		goto error;
+
+	size_t len = strlen(keys);
+	while (len > 0) {
+		Packet pkt = { .type = MSG_SEND_KEYS };
+		size_t chunk = len > sizeof(pkt.u.msg) ? sizeof(pkt.u.msg) : len;
+		memcpy(pkt.u.msg, keys, chunk);
+		pkt.len = chunk;
+		if (!client_send_packet(&pkt))
+			goto error;
+		keys += chunk;
+		len -= chunk;
+	}
+
+	close(server.socket);
+	server.socket = -1;
+	return true;
+
+error:
+	if (server.socket > 0) {
+		close(server.socket);
+		server.socket = -1;
+	}
+	return false;
+}
+
 static void client_restore_terminal(void) {
 	if (!has_term)
 		return;

@@ -69,6 +69,9 @@ enum PacketType {
 	MSG_RESIZE  = 3,
 	MSG_EXIT    = 4,
 	MSG_PID     = 5,
+	MSG_DUMP    = 6,
+	MSG_DUMP_END = 7,
+	MSG_SEND_KEYS = 8,
 };
 
 typedef struct {
@@ -102,6 +105,8 @@ struct Client {
 	Client *next;
 };
 
+#define HISTORY_CAP (1024 * 1024)
+
 typedef struct {
 	Client *clients;
 	int socket;
@@ -114,6 +119,9 @@ typedef struct {
 	volatile sig_atomic_t running;
 	const char *name;
 	const char *session_name;
+	char history[HISTORY_CAP];
+	size_t history_start;
+	size_t history_len;
 	char host[255];
 	bool read_pty;
 } Server;
@@ -128,6 +136,7 @@ static struct sockaddr_un sockaddr = {
 };
 
 static bool set_socket_name(struct sockaddr_un *sockaddr, const char *name);
+static int session_connect(const char *name);
 static void die(const char *s);
 static void info(const char *str, ...);
 
@@ -223,7 +232,7 @@ static void die(const char *s) {
 }
 
 static void usage(void) {
-	fprintf(stderr, "usage: abduco [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-f] [-e detachkey] name command\n");
+	fprintf(stderr, "usage: abduco [-a|-A|-c|-n|-d|-K] [-p] [-r] [-q] [-l] [-f] [-e detachkey] name [command|string]\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -596,6 +605,7 @@ int main(int argc, char *argv[]) {
 	int opt;
 	bool force = false;
 	char **cmd = NULL, action = '\0';
+	const char *key_string = NULL;
 
 	char *default_cmd[4] = { "/bin/sh", "-c", getenv("ABDUCO_CMD"), NULL };
 	if (!default_cmd[2]) {
@@ -606,11 +616,13 @@ int main(int argc, char *argv[]) {
 	server.name = basename(argv[0]);
 	gethostname(server.host+1, sizeof(server.host) - 1);
 
-	while ((opt = getopt(argc, argv, "aAclne:fpqrv")) != -1) {
+	while ((opt = getopt(argc, argv, "aAcdKlne:fpqrv")) != -1) {
 		switch (opt) {
 		case 'a':
 		case 'A':
 		case 'c':
+		case 'd':
+		case 'K':
 		case 'n':
 			action = opt;
 			break;
@@ -649,12 +661,20 @@ int main(int argc, char *argv[]) {
 		server.session_name = argv[optind];
 
 	/* if yet more trailing arguments, they must be the command */
-	if (optind + 1 < argc)
+	if (action == 'K') {
+		if (optind + 2 != argc)
+			usage();
+		key_string = argv[optind + 1];
+	} else if (action == 'd') {
+		if (optind + 1 != argc)
+			usage();
+	} else if (optind + 1 < argc) {
 		cmd = &argv[optind + 1];
-	else
+	} else {
 		cmd = default_cmd;
+	}
 
-	if (server.session_name && !isatty(STDIN_FILENO))
+	if (server.session_name && !isatty(STDIN_FILENO) && action != 'd' && action != 'K')
 		passthrough = true;
 
 	if (passthrough) {
@@ -711,6 +731,14 @@ int main(int argc, char *argv[]) {
 			action = 'c';
 			goto redo;
 		}
+		break;
+	case 'd':
+		if (!dump_session(server.session_name))
+			die("dump-session");
+		break;
+	case 'K':
+		if (!send_keys_session(server.session_name, key_string))
+			die("send-keys-session");
 		break;
 	}
 
