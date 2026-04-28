@@ -232,8 +232,19 @@ static void die(const char *s) {
 }
 
 static void usage(void) {
-	fprintf(stderr, "usage: abduco [-a|-A|-c|-n|-d|-K] [-p] [-r] [-q] [-l] [-f] [-e detachkey] name [command|string]\n");
+	fprintf(stderr, "usage: abduco [-a|-A|-c|-n|-d|-K] [-N bytes] [-L lines] [-x] [-p] [-r] [-q] [-l] [-f] [-e detachkey] name [command|keys...]\n");
 	exit(EXIT_FAILURE);
+}
+
+static size_t parse_size_arg(const char *s) {
+	char *end = NULL;
+	errno = 0;
+	unsigned long long value = strtoull(s, &end, 10);
+	if (errno || !s[0] || (end && *end))
+		usage();
+	if (value > SIZE_MAX)
+		usage();
+	return (size_t)value;
 }
 
 static bool xsnprintf(char *buf, size_t size, const char *fmt, ...) {
@@ -605,7 +616,10 @@ int main(int argc, char *argv[]) {
 	int opt;
 	bool force = false;
 	char **cmd = NULL, action = '\0';
-	const char *key_string = NULL;
+	char **key_argv = NULL;
+	int key_argc = 0;
+	bool key_literal = false;
+	size_t dump_max_bytes = 0, dump_max_lines = 0;
 
 	char *default_cmd[4] = { "/bin/sh", "-c", getenv("ABDUCO_CMD"), NULL };
 	if (!default_cmd[2]) {
@@ -616,7 +630,7 @@ int main(int argc, char *argv[]) {
 	server.name = basename(argv[0]);
 	gethostname(server.host+1, sizeof(server.host) - 1);
 
-	while ((opt = getopt(argc, argv, "aAcdKlne:fpqrv")) != -1) {
+	while ((opt = getopt(argc, argv, "aAcdKN:L:xlne:fpqrv")) != -1) {
 		switch (opt) {
 		case 'a':
 		case 'A':
@@ -632,6 +646,15 @@ int main(int argc, char *argv[]) {
 			if (optarg[0] == '^' && optarg[1])
 				optarg[0] = CTRL(optarg[1]);
 			KEY_DETACH = optarg[0];
+			break;
+		case 'N':
+			dump_max_bytes = parse_size_arg(optarg);
+			break;
+		case 'L':
+			dump_max_lines = parse_size_arg(optarg);
+			break;
+		case 'x':
+			key_literal = true;
 			break;
 		case 'f':
 			force = true;
@@ -662,9 +685,10 @@ int main(int argc, char *argv[]) {
 
 	/* if yet more trailing arguments, they must be the command */
 	if (action == 'K') {
-		if (optind + 2 != argc)
+		if (optind + 2 > argc)
 			usage();
-		key_string = argv[optind + 1];
+		key_argv = &argv[optind + 1];
+		key_argc = argc - optind - 1;
 	} else if (action == 'd') {
 		if (optind + 1 != argc)
 			usage();
@@ -687,6 +711,12 @@ int main(int argc, char *argv[]) {
 	if (!action && !server.session_name)
 		exit(list_session());
 	if (!action || !server.session_name)
+		usage();
+	if (dump_max_bytes && dump_max_lines)
+		usage();
+	if (action != 'd' && (dump_max_bytes || dump_max_lines))
+		usage();
+	if (action != 'K' && key_literal)
 		usage();
 
 	if (!passthrough && tcgetattr(STDIN_FILENO, &orig_term) != -1) {
@@ -733,11 +763,11 @@ int main(int argc, char *argv[]) {
 		}
 		break;
 	case 'd':
-		if (!dump_session(server.session_name))
+		if (!dump_session(server.session_name, dump_max_bytes, dump_max_lines))
 			die("dump-session");
 		break;
 	case 'K':
-		if (!send_keys_session(server.session_name, key_string))
+		if (!send_keys_session(server.session_name, key_argc, key_argv, key_literal))
 			die("send-keys-session");
 		break;
 	}
