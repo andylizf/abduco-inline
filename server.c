@@ -140,7 +140,7 @@ static bool server_send_packet(Client *c, Packet *pkt) {
 	return false;
 }
 
-static bool server_send_history(Client *c) {
+static bool server_send_history(Client *c, bool send_end) {
 	size_t remaining = server.history_len;
 	size_t pos = server.history_start;
 
@@ -158,6 +158,9 @@ static bool server_send_history(Client *c) {
 		pos = (pos + chunk) % HISTORY_CAP;
 		remaining -= chunk;
 	}
+
+	if (!send_end)
+		return true;
 
 	Packet end = { .type = MSG_DUMP_END };
 	return server_send_packet(c, &end);
@@ -272,9 +275,10 @@ static void server_mainloop(void) {
 					c->flags = client_packet.u.i;
 					if (c->flags & CLIENT_LOWPRIORITY)
 						server_sink_client();
+					server_send_history(c, false);
 					break;
 				case MSG_DUMP:
-					server_send_history(c);
+					server_send_history(c, true);
 					c->state = STATE_DISCONNECTED;
 					break;
 				case MSG_SEND_KEYS:
