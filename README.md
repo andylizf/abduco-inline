@@ -39,14 +39,97 @@ there as well. For Codex that means `codex --no-alt-screen`.
 When the wrapped application intentionally enters fullscreen mode, scrollback
 behavior is owned by that application until it exits fullscreen mode.
 
-## What changed
+## Install
+
+Download a pre-built binary from the [releases page](https://github.com/andylizf/abduco-inline/releases):
+
+```sh
+# Linux x86_64
+curl -Lo abduco https://github.com/andylizf/abduco-inline/releases/latest/download/abduco-linux-x86_64
+chmod +x abduco
+sudo mv abduco /usr/local/bin/abduco-inline
+
+# macOS arm64
+curl -Lo abduco https://github.com/andylizf/abduco-inline/releases/latest/download/abduco-macos-arm64
+chmod +x abduco
+sudo mv abduco /usr/local/bin/abduco-inline
+```
+
+Or build from source (requires a C compiler, no other dependencies):
+
+```sh
+./configure && make && sudo make install
+```
+
+The installed binary is named `abduco` by default. Rename or symlink to
+`abduco-inline` if you want to keep it alongside upstream abduco.
+
+## Automation flags
+
+In addition to all standard abduco flags, `abduco-inline` adds:
+
+### `-d` — dump session output
+
+Print the current scrollback buffer of a running session to stdout and exit.
+
+```sh
+abduco-inline -d my-agent
+```
+
+### `-d -L <n>` — last N lines
+
+```sh
+abduco-inline -d -L 50 my-agent       # last 50 lines
+```
+
+### `-d -N <bytes>` — last N bytes
+
+```sh
+abduco-inline -d -N 4096 my-agent     # last 4096 bytes
+```
+
+(`-L` and `-N` are mutually exclusive.)
+
+### `-K` — send keys to a session
+
+Send keystrokes to a running session without attaching. Accepts key names
+(`Enter`, `Tab`, `Esc`, `Up`, `Down`, `C-c`, `C-d`, …) or literal strings.
+
+```sh
+abduco-inline -K my-agent "echo hello" Enter
+abduco-inline -K my-agent C-c
+```
+
+### `-K -x` — literal mode
+
+Send the remaining arguments as raw bytes (space-separated tokens are joined
+with a space between them).
+
+```sh
+abduco-inline -K -x my-agent $'echo hello\n'
+```
+
+### Typical automation loop
+
+```sh
+# start agent in background
+abduco-inline -n my-agent my-command
+
+# poll output
+abduco-inline -d -L 20 my-agent
+
+# send input
+abduco-inline -K my-agent "some input" Enter
+```
+
+## What changed from upstream
 
 This fork removes the client-side `CSI ? 1049 h/l` alternate-screen enter/leave
 sequences from abduco's attach path. It still switches the terminal to raw mode
 while attached, forwards input/output through the session pty, and restores the
 terminal settings on detach.
 
-Everything else is upstream abduco.
+It also adds the `-d`/`-K`/`-N`/`-L`/`-x` automation flags described above.
 
 ---
 
