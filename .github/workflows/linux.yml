@@ -1,0 +1,16 @@
+name: Linux
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: cd c && ./configure && make
+
+      - name: Test
+        run: ./tests/testsuite-inline.sh ./c/lich

@@ -1,0 +1,17 @@
+name: macOS
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: cd c && ./configure && make
+
+      - name: Test
+        timeout-minutes: 2
+        run: ./tests/testsuite-inline.sh ./c/lich

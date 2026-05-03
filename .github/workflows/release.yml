@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cd c && ./configure && make && strip lich
+          mv c/lich lich-linux-x86_64
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lich-linux-x86_64
+          generate_release_notes: true
+
+  release-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cd c && ./configure && make && strip lich
+          mv c/lich lich-macos-arm64
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lich-macos-arm64
+          generate_release_notes: true
