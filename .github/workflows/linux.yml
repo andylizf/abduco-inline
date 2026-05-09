@@ -9,8 +9,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build
+      - name: Build Rust
         run: cargo build --release
 
-      - name: Test
+      - name: Build C reference
+        run: cd c && ./configure && make
+
+      - name: Test Rust
         run: ./tests/testsuite-inline.sh ./target/release/lich
+
+      - name: Test C/Rust parity
+        run: ./tests/testsuite-parity.sh ./c/lich ./target/release/lich

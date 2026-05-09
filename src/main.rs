@@ -318,23 +318,38 @@ fn create_session(name: &str, cmd: Vec<String>, read_pty: bool, _opts: &Opts) ->
     let listener = UnixListener::bind(&path)?;
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
 
+    let mut sync_pipe = [0; 2];
+    if unsafe { libc::pipe(sync_pipe.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     let winsize = current_winsize();
     let fork_result = unsafe { libc::fork() };
     if fork_result < 0 {
+        unsafe {
+            libc::close(sync_pipe[0]);
+            libc::close(sync_pipe[1]);
+        }
         return Err(io::Error::last_os_error());
     }
     if fork_result > 0 {
+        unsafe {
+            libc::close(sync_pipe[1]);
+        }
         drop(listener);
-        std::thread::sleep(Duration::from_millis(80));
-        return Ok(());
+        let result = read_startup_status(sync_pipe[0]);
+        if result.is_err() {
+            let _ = fs::remove_file(&path);
+        }
+        return result;
     }
 
     unsafe {
+        libc::close(sync_pipe[0]);
         libc::setsid();
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
-    match unsafe { run_server(listener, path, cmd, winsize, read_pty) } {
+    match unsafe { run_server(listener, path, cmd, winsize, read_pty, sync_pipe[1]) } {
         Ok(()) => process::exit(0),
         Err(_) => process::exit(1),
     }
@@ -346,6 +361,7 @@ unsafe fn run_server(
     cmd: Vec<String>,
     winsize: libc::winsize,
     read_pty: bool,
+    startup_fd: RawFd,
 ) -> io::Result<()> {
     let mut master: libc::c_int = -1;
     let pid = unsafe {
@@ -357,9 +373,17 @@ unsafe fn run_server(
         )
     };
     if pid < 0 {
+        let msg = format!("server-forkpty: {}\n", io::Error::last_os_error());
+        let _ = fd_write_all(startup_fd, msg.as_bytes());
+        unsafe {
+            libc::close(startup_fd);
+        }
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
+        unsafe {
+            libc::fcntl(startup_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
         let cstrings: Vec<CString> = cmd
             .iter()
             .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
@@ -368,15 +392,52 @@ unsafe fn run_server(
         argv.push(std::ptr::null());
         unsafe {
             libc::execvp(argv[0], argv.as_ptr());
+            let msg = format!(
+                "server-execvp: {}: {}\n",
+                cmd[0],
+                io::Error::last_os_error()
+            );
+            let _ = fd_write_all(startup_fd, msg.as_bytes());
             libc::_exit(127);
         }
     }
 
+    unsafe {
+        libc::close(startup_fd);
+    }
     let _ = env::set_current_dir("/");
     redirect_stdio_to_null();
     set_nonblocking(listener.as_raw_fd())?;
     set_nonblocking(master)?;
     server_loop(listener, path, master, pid, read_pty)
+}
+
+fn read_startup_status(fd: RawFd) -> io::Result<()> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 256];
+    loop {
+        match fd_read(fd, &mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(err);
+            }
+        }
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&buf).trim_end().to_string(),
+        ))
+    }
 }
 
 fn server_loop(
