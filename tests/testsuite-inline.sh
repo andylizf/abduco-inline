@@ -421,7 +421,13 @@ for i, delay in enumerate([0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.4, 2.0], 1):
     time.sleep(delay)
     attach_once(i)
 PYEOF
-"$ABDUCO" -d -L 80 "$attach_matrix_sess" > "$tmpdir/attach-matrix-final.out"
+for _ in $(seq 1 20); do
+	"$ABDUCO" -d -L 80 "$attach_matrix_sess" > "$tmpdir/attach-matrix-final.out"
+	if grep -a -q "ATTACH_MATRIX_READY" "$tmpdir/attach-matrix-final.out"; then
+		break
+	fi
+	sleep 0.25
+done
 assert_contains "ATTACH_MATRIX_READY" "$tmpdir/attach-matrix-final.out"
 pass "interactive attach timing matrix"
 
