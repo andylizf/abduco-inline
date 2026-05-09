@@ -89,6 +89,90 @@ if ! run_with_timeout 3 "$tmpdir/write_all_nonblock"; then
 fi
 pass "nonblocking write_all returns on EAGAIN"
 
+run "attach waits for complete packet on partial socket read"
+partial_sock="$tmpdir/partial-packet.sock"
+partial_out="$tmpdir/partial-packet.out"
+python3 - "$ABDUCO" "$partial_sock" "$partial_out" <<'PYEOF'
+import os
+import pty
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+abduco, sock_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(1)
+
+master, slave = pty.openpty()
+client = subprocess.Popen(
+    [abduco, "-a", sock_path],
+    stdin=slave,
+    stdout=slave,
+    stderr=subprocess.PIPE,
+    close_fds=True,
+)
+os.close(slave)
+conn, _ = srv.accept()
+conn.sendall(struct.pack("@IIQ", 5, 8, os.getpid()))
+
+# Read the MSG_ATTACH packet sent by the client. A following MSG_RESIZE may
+# already be queued; the fake server can ignore it for this regression.
+buf = b""
+while len(buf) < 12:
+    chunk = conn.recv(12 - len(buf))
+    if not chunk:
+        raise SystemExit("client disconnected before attach packet")
+    buf += chunk
+
+payload = b"PARTIAL_PACKET_OK\n"
+pkt = struct.pack("@II", 0, len(payload)) + payload
+conn.sendall(pkt[:5])
+time.sleep(0.5)
+if client.poll() is not None:
+    raise SystemExit("client exited before complete packet arrived")
+conn.sendall(pkt[5:])
+time.sleep(0.1)
+conn.sendall(struct.pack("@III", 4, 4, 0))
+
+out = b""
+deadline = time.monotonic() + 3
+while time.monotonic() < deadline:
+    r, _, _ = select.select([master], [], [], 0.1)
+    if r:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    if client.poll() is not None:
+        break
+err = client.stderr.read() or b""
+try:
+    client.wait(timeout=1)
+except subprocess.TimeoutExpired:
+    client.kill()
+    raise
+os.close(master)
+with open(out_path, "wb") as f:
+    f.write(out)
+if client.returncode != 0:
+    sys.stderr.buffer.write(err)
+    raise SystemExit(client.returncode)
+PYEOF
+assert_contains "PARTIAL_PACKET_OK" "$partial_out"
+pass "attach waits for complete packet on partial socket read"
+
 run "no-tty fallback winsize is configurable"
 sess="$prefix-winsize"
 python3 - "$ABDUCO" "$sess" <<'PYEOF'

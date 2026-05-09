@@ -555,8 +555,6 @@ static bool attach_session(const char *name, const bool terminate) {
 		close(server.socket);
 	if ((server.socket = session_connect(name)) == -1)
 		return false;
-	if (server_set_socket_non_blocking(server.socket) == -1)
-		return false;
 
 	struct sigaction sa;
 	sa.sa_flags = 0;
