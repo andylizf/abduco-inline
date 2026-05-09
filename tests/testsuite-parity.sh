@@ -172,8 +172,12 @@ os.write(master, b"\x1c")
 try:
     client.wait(timeout=2)
 except subprocess.TimeoutExpired:
-    client.kill()
-    raise
+    client.terminate()
+    try:
+        client.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        client.kill()
+        client.wait(timeout=1)
 os.close(master)
 PYEOF
 python3 - "$R_LICH" "$prefix-r-readonly" <<'PYEOF'
@@ -203,8 +207,12 @@ os.write(master, b"\x1c")
 try:
     client.wait(timeout=2)
 except subprocess.TimeoutExpired:
-    client.kill()
-    raise
+    client.terminate()
+    try:
+        client.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        client.kill()
+        client.wait(timeout=1)
 os.close(master)
 PYEOF
 sleep 0.3
