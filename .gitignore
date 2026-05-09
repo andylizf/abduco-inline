@@ -1,6 +1,7 @@
 /c/config.h
 /c/config.mk
 /c/lich
+/target
 /lich-linux-x86_64
 /lich-macos-arm64
 *.css

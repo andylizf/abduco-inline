@@ -10,7 +10,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build
-        run: cd c && ./configure && make
+        run: cargo build --release
 
       - name: Test
-        run: ./tests/testsuite-inline.sh ./c/lich
+        run: ./tests/testsuite-inline.sh ./target/release/lich

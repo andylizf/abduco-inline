@@ -1,0 +1,1038 @@
+use std::collections::VecDeque;
+use std::env;
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::mem;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::process;
+use std::time::Duration;
+
+const MSG_CONTENT: u32 = 0;
+const MSG_ATTACH: u32 = 1;
+const MSG_DETACH: u32 = 2;
+const MSG_RESIZE: u32 = 3;
+const MSG_EXIT: u32 = 4;
+const MSG_PID: u32 = 5;
+const MSG_DUMP: u32 = 6;
+const MSG_DUMP_END: u32 = 7;
+const MSG_SEND_KEYS: u32 = 8;
+
+const CLIENT_READONLY: u32 = 1 << 0;
+const CLIENT_LOWPRIORITY: u32 = 1 << 1;
+const HISTORY_CAP: usize = 1024 * 1024;
+const MAX_PAYLOAD: usize = 4096 - 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Attach,
+    AttachOrCreate,
+    CreateAttach,
+    Create,
+    Dump,
+    SendKeys,
+}
+
+struct Opts {
+    action: Option<Action>,
+    name: Option<String>,
+    rest: Vec<String>,
+    literal: bool,
+    max_bytes: usize,
+    max_lines: usize,
+    flags: u32,
+    quiet: bool,
+    force: bool,
+    passthrough: bool,
+    detach_key: u8,
+}
+
+#[derive(Clone)]
+struct Packet {
+    typ: u32,
+    payload: Vec<u8>,
+}
+
+struct Client {
+    stream: UnixStream,
+    buf: Vec<u8>,
+    attached: bool,
+    flags: u32,
+    disconnected: bool,
+}
+
+struct History {
+    bytes: VecDeque<u8>,
+}
+
+impl History {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(HISTORY_CAP),
+        }
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        if data.len() >= HISTORY_CAP {
+            self.bytes.clear();
+            self.bytes
+                .extend(data[data.len() - HISTORY_CAP..].iter().copied());
+            return;
+        }
+        while self.bytes.len() + data.len() > HISTORY_CAP {
+            self.bytes.pop_front();
+        }
+        self.bytes.extend(data.iter().copied());
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes.iter().copied().collect()
+    }
+}
+
+fn main() {
+    if let Err(err) = real_main() {
+        eprintln!("lich: {err}");
+        process::exit(1);
+    }
+}
+
+fn real_main() -> io::Result<()> {
+    let mut opts = parse_args()?;
+    if opts.name.is_some()
+        && !isatty(libc::STDIN_FILENO)
+        && !matches!(opts.action, Some(Action::Dump | Action::SendKeys))
+    {
+        opts.passthrough = true;
+        opts.quiet = true;
+        opts.flags |= CLIENT_LOWPRIORITY;
+        if opts.action.is_none() {
+            opts.action = Some(Action::Attach);
+        }
+    }
+
+    if opts.action.is_none() && opts.name.is_none() {
+        return list_sessions();
+    }
+
+    let action = opts.action.ok_or_else(usage_err)?;
+    let name = opts.name.clone().ok_or_else(usage_err)?;
+
+    match action {
+        Action::Create => create_session(&name, command_args(&opts)?, false, &opts),
+        Action::CreateAttach => {
+            create_session(&name, command_args(&opts)?, true, &opts)?;
+            attach_session(&name, true, &opts)
+        }
+        Action::Attach => attach_session(&name, true, &opts),
+        Action::AttachOrCreate => {
+            if session_alive(&name) {
+                attach_session(&name, true, &opts)
+            } else {
+                create_session(&name, command_args(&opts)?, true, &opts)?;
+                attach_session(&name, true, &opts)
+            }
+        }
+        Action::Dump => dump_session(&name, opts.max_bytes, opts.max_lines),
+        Action::SendKeys => send_keys_session(&name, &opts.rest, opts.literal),
+    }
+}
+
+fn parse_args() -> io::Result<Opts> {
+    let mut args = env::args().skip(1);
+    let mut opts = Opts {
+        action: None,
+        name: None,
+        rest: Vec::new(),
+        literal: false,
+        max_bytes: 0,
+        max_lines: 0,
+        flags: 0,
+        quiet: false,
+        force: false,
+        passthrough: false,
+        detach_key: 0x1c,
+    };
+
+    while let Some(arg) = args.next() {
+        if !arg.starts_with('-') || arg == "-" {
+            opts.name = Some(arg);
+            opts.rest.extend(args);
+            break;
+        }
+        match arg.as_str() {
+            "-a" => opts.action = Some(Action::Attach),
+            "-A" => opts.action = Some(Action::AttachOrCreate),
+            "-c" => opts.action = Some(Action::CreateAttach),
+            "-n" => opts.action = Some(Action::Create),
+            "-d" => opts.action = Some(Action::Dump),
+            "-K" => opts.action = Some(Action::SendKeys),
+            "-x" => opts.literal = true,
+            "-q" => opts.quiet = true,
+            "-f" => opts.force = true,
+            "-p" => opts.passthrough = true,
+            "-r" => opts.flags |= CLIENT_READONLY,
+            "-l" => opts.flags |= CLIENT_LOWPRIORITY,
+            "-v" => {
+                println!("lich-rust-0.1.0");
+                process::exit(0);
+            }
+            "-N" => opts.max_bytes = parse_size(args.next())?,
+            "-L" => opts.max_lines = parse_size(args.next())?,
+            "-e" => {
+                let key = args.next().ok_or_else(usage_err)?;
+                opts.detach_key = parse_detach_key(&key);
+            }
+            _ if arg.starts_with("-N") && arg.len() > 2 => {
+                opts.max_bytes = parse_size(Some(arg[2..].to_string()))?
+            }
+            _ if arg.starts_with("-L") && arg.len() > 2 => {
+                opts.max_lines = parse_size(Some(arg[2..].to_string()))?
+            }
+            _ => return Err(usage_err()),
+        }
+    }
+
+    if opts.max_bytes != 0 && opts.max_lines != 0 {
+        return Err(usage_err());
+    }
+    if opts.action != Some(Action::Dump) && (opts.max_bytes != 0 || opts.max_lines != 0) {
+        return Err(usage_err());
+    }
+    if opts.action != Some(Action::SendKeys) && opts.literal {
+        return Err(usage_err());
+    }
+    if opts.action == Some(Action::Dump) && !opts.rest.is_empty() {
+        return Err(usage_err());
+    }
+    if opts.action == Some(Action::SendKeys) && opts.rest.is_empty() {
+        return Err(usage_err());
+    }
+    Ok(opts)
+}
+
+fn usage_err() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "usage: lich [-a|-A|-c|-n|-d|-K] [-N bytes] [-L lines] [-x] [-p] [-r] [-q] [-l] [-f] [-e detachkey] name [command|keys...]",
+    )
+}
+
+fn parse_size(value: Option<String>) -> io::Result<usize> {
+    value
+        .ok_or_else(usage_err)?
+        .parse::<usize>()
+        .map_err(|_| usage_err())
+}
+
+fn parse_detach_key(key: &str) -> u8 {
+    let bytes = key.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'^' {
+        bytes[1] & 0x1f
+    } else {
+        bytes.first().copied().unwrap_or(0x1c)
+    }
+}
+
+fn command_args(opts: &Opts) -> io::Result<Vec<String>> {
+    if !opts.rest.is_empty() {
+        return Ok(opts.rest.clone());
+    }
+    if let Ok(cmd) = env::var("ABDUCO_CMD") {
+        return Ok(vec!["/bin/sh".into(), "-c".into(), cmd]);
+    }
+    Ok(vec!["dvtm".into()])
+}
+
+fn socket_path(name: &str) -> io::Result<PathBuf> {
+    if name.starts_with('/') {
+        return Ok(PathBuf::from(name));
+    }
+    if name.starts_with("./") || name.starts_with("../") {
+        return Ok(env::current_dir()?.join(name));
+    }
+    let host = hostname();
+    let base = socket_base_dir()?;
+    Ok(base.join(format!("{name}@{host}")))
+}
+
+fn socket_base_dir() -> io::Result<PathBuf> {
+    let user = env::var("USER").unwrap_or_else(|_| unsafe { libc::getuid().to_string() });
+    let candidates = [
+        env::var_os("ABDUCO_SOCKET_DIR").map(PathBuf::from),
+        env::var_os("HOME").map(|h| PathBuf::from(h).join(".lich")),
+        env::var_os("TMPDIR").map(|t| PathBuf::from(t).join("lich").join(&user)),
+        Some(PathBuf::from("/tmp").join("lich").join(&user)),
+    ];
+    for dir in candidates.into_iter().flatten() {
+        if fs::create_dir_all(&dir).is_ok() {
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+            return Ok(dir);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no socket directory",
+    ))
+}
+
+fn hostname() -> String {
+    let mut buf = [0u8; 255];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    } else {
+        "localhost".into()
+    }
+}
+
+fn connect_session(name: &str) -> io::Result<UnixStream> {
+    let path = socket_path(name)?;
+    UnixStream::connect(&path).inspect_err(|err| {
+        if err.kind() == io::ErrorKind::ConnectionRefused {
+            let _ = fs::remove_file(&path);
+        }
+    })
+}
+
+fn session_alive(name: &str) -> bool {
+    let Ok(mut stream) = connect_session(name) else {
+        return false;
+    };
+    recv_packet_blocking(&mut stream).is_ok_and(|pkt| pkt.typ == MSG_PID)
+}
+
+fn create_session(name: &str, cmd: Vec<String>, read_pty: bool, _opts: &Opts) -> io::Result<()> {
+    if session_alive(name) {
+        return Err(io::Error::new(io::ErrorKind::AddrInUse, "session exists"));
+    }
+    let path = socket_path(name)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+
+    let winsize = current_winsize();
+    let fork_result = unsafe { libc::fork() };
+    if fork_result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if fork_result > 0 {
+        drop(listener);
+        std::thread::sleep(Duration::from_millis(80));
+        return Ok(());
+    }
+
+    unsafe {
+        libc::setsid();
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    match unsafe { run_server(listener, path, cmd, winsize, read_pty) } {
+        Ok(()) => process::exit(0),
+        Err(_) => process::exit(1),
+    }
+}
+
+unsafe fn run_server(
+    listener: UnixListener,
+    path: PathBuf,
+    cmd: Vec<String>,
+    winsize: libc::winsize,
+    read_pty: bool,
+) -> io::Result<()> {
+    let mut master: libc::c_int = -1;
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        let cstrings: Vec<CString> = cmd
+            .iter()
+            .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+            .collect();
+        let mut argv: Vec<*const libc::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        unsafe {
+            libc::execvp(argv[0], argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+
+    let _ = env::set_current_dir("/");
+    redirect_stdio_to_null();
+    set_nonblocking(listener.as_raw_fd())?;
+    set_nonblocking(master)?;
+    server_loop(listener, path, master, pid, read_pty)
+}
+
+fn server_loop(
+    listener: UnixListener,
+    path: PathBuf,
+    master: RawFd,
+    child_pid: libc::pid_t,
+    mut read_pty: bool,
+) -> io::Result<()> {
+    let mut clients: Vec<Client> = Vec::new();
+    let mut history = History::new();
+    let mut child_exit: Option<i32> = None;
+
+    loop {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = send_packet_blocking(
+                        &mut stream,
+                        &Packet {
+                            typ: MSG_PID,
+                            payload: unsafe { (libc::getpid() as u64).to_ne_bytes().to_vec() },
+                        },
+                    );
+                    stream.set_nonblocking(true)?;
+                    clients.push(Client {
+                        stream,
+                        buf: Vec::new(),
+                        attached: false,
+                        flags: 0,
+                        disconnected: false,
+                    });
+                    read_pty = true;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+
+        if read_pty {
+            let mut buf = [0u8; MAX_PAYLOAD];
+            loop {
+                match fd_read(master, &mut buf) {
+                    Ok(0) => {
+                        read_pty = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        history.append(&buf[..n]);
+                        broadcast_content(&mut clients, &buf[..n]);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        read_pty = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if child_exit.is_none() {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+            if r == child_pid {
+                child_exit = Some(exit_status(status));
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o610));
+            }
+        }
+
+        for idx in 0..clients.len() {
+            read_client_packets(idx, &mut clients, master, child_pid, &history);
+        }
+        clients.retain(|c| !c.disconnected);
+
+        if let Some(status) = child_exit {
+            if clients.is_empty() {
+                let _ = fs::remove_file(&path);
+                return Ok(());
+            }
+            for client in &mut clients {
+                let _ = send_packet_nonblocking(
+                    client,
+                    &Packet {
+                        typ: MSG_EXIT,
+                        payload: (status as u32).to_ne_bytes().to_vec(),
+                    },
+                );
+                client.disconnected = true;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn read_client_packets(
+    idx: usize,
+    clients: &mut [Client],
+    master: RawFd,
+    child_pid: libc::pid_t,
+    history: &History,
+) {
+    let mut tmp = [0u8; 8192];
+    let mut saw_eof = false;
+    loop {
+        match clients[idx].stream.read(&mut tmp) {
+            Ok(0) => {
+                saw_eof = true;
+                break;
+            }
+            Ok(n) => clients[idx].buf.extend_from_slice(&tmp[..n]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                clients[idx].disconnected = true;
+                return;
+            }
+        }
+    }
+
+    while let Some(pkt) = pop_packet(&mut clients[idx].buf) {
+        match pkt.typ {
+            MSG_CONTENT | MSG_SEND_KEYS if clients[idx].flags & CLIENT_READONLY == 0 => {
+                let _ = fd_write_all(master, &pkt.payload);
+            }
+            MSG_CONTENT | MSG_SEND_KEYS => {}
+            MSG_ATTACH => {
+                clients[idx].attached = true;
+                clients[idx].flags = read_u32(&pkt.payload).unwrap_or(0);
+                send_history(&mut clients[idx], history, false);
+            }
+            MSG_DUMP => {
+                send_history(&mut clients[idx], history, true);
+                clients[idx].disconnected = true;
+            }
+            MSG_RESIZE if pkt.payload.len() >= 4 => {
+                let rows = u16::from_ne_bytes([pkt.payload[0], pkt.payload[1]]);
+                let cols = u16::from_ne_bytes([pkt.payload[2], pkt.payload[3]]);
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe {
+                    libc::ioctl(master, libc::TIOCSWINSZ, &ws);
+                    libc::kill(-child_pid, libc::SIGWINCH);
+                }
+            }
+            MSG_RESIZE => {}
+            MSG_DETACH | MSG_EXIT => clients[idx].disconnected = true,
+            _ => {}
+        }
+    }
+    if saw_eof {
+        clients[idx].disconnected = true;
+    }
+}
+
+fn send_history(client: &mut Client, history: &History, send_end: bool) {
+    let snap = history.snapshot();
+    for chunk in snap.chunks(MAX_PAYLOAD) {
+        if send_packet_nonblocking(
+            client,
+            &Packet {
+                typ: MSG_CONTENT,
+                payload: chunk.to_vec(),
+            },
+        )
+        .is_err()
+        {
+            client.disconnected = true;
+            return;
+        }
+    }
+    if send_end {
+        let _ = send_packet_nonblocking(
+            client,
+            &Packet {
+                typ: MSG_DUMP_END,
+                payload: Vec::new(),
+            },
+        );
+    }
+}
+
+fn broadcast_content(clients: &mut [Client], bytes: &[u8]) {
+    for client in clients.iter_mut().filter(|c| c.attached) {
+        if send_packet_nonblocking(
+            client,
+            &Packet {
+                typ: MSG_CONTENT,
+                payload: bytes.to_vec(),
+            },
+        )
+        .is_err()
+        {
+            client.disconnected = true;
+        }
+    }
+}
+
+fn attach_session(name: &str, terminate: bool, opts: &Opts) -> io::Result<()> {
+    let mut stream = connect_session(name)?;
+    let _pid = recv_packet_blocking(&mut stream)?;
+    send_packet_blocking(
+        &mut stream,
+        &Packet {
+            typ: MSG_ATTACH,
+            payload: opts.flags.to_ne_bytes().to_vec(),
+        },
+    )?;
+    send_resize(&mut stream)?;
+
+    let raw_guard = RawMode::enter(opts.passthrough)?;
+    let status = client_loop(&mut stream, opts)?;
+    drop(raw_guard);
+
+    match status {
+        ClientStatus::Detached => info(opts, name, "detached"),
+        ClientStatus::IoError => info(opts, name, "exited due to I/O errors"),
+        ClientStatus::Exited(code) => {
+            info(
+                opts,
+                name,
+                &format!("session terminated with exit status {code}"),
+            );
+            if terminate {
+                process::exit(code);
+            }
+        }
+    }
+    Ok(())
+}
+
+enum ClientStatus {
+    Detached,
+    IoError,
+    Exited(i32),
+}
+
+fn client_loop(stream: &mut UnixStream, opts: &Opts) -> io::Result<ClientStatus> {
+    loop {
+        let sock = stream.as_raw_fd();
+        let mut fds: libc::fd_set = unsafe { mem::zeroed() };
+        unsafe {
+            libc::FD_SET(libc::STDIN_FILENO, &mut fds);
+            libc::FD_SET(sock, &mut fds);
+        }
+        let maxfd = sock.max(libc::STDIN_FILENO) + 1;
+        let rc = unsafe {
+            libc::select(
+                maxfd,
+                &mut fds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if unsafe { libc::FD_ISSET(sock, &fds) } {
+            match recv_packet_blocking(stream) {
+                Ok(pkt) => match pkt.typ {
+                    MSG_CONTENT if !opts.passthrough => {
+                        io::stdout().write_all(&pkt.payload)?;
+                        io::stdout().flush()?;
+                    }
+                    MSG_CONTENT => {}
+                    MSG_RESIZE => send_resize(stream)?,
+                    MSG_EXIT => {
+                        let code = read_u32(&pkt.payload).unwrap_or(0) as i32;
+                        let _ = send_packet_blocking(stream, &pkt);
+                        return Ok(ClientStatus::Exited(code));
+                    }
+                    _ => {}
+                },
+                Err(_) => return Ok(ClientStatus::IoError),
+            }
+        }
+        if unsafe { libc::FD_ISSET(libc::STDIN_FILENO, &fds) } {
+            let mut buf = [0u8; MAX_PAYLOAD];
+            let n = match io::stdin().read(&mut buf) {
+                Ok(0) => return Ok(ClientStatus::Detached),
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            if buf[0] == opts.detach_key {
+                send_packet_blocking(
+                    stream,
+                    &Packet {
+                        typ: MSG_DETACH,
+                        payload: Vec::new(),
+                    },
+                )?;
+                return Ok(ClientStatus::Detached);
+            }
+            if opts.flags & CLIENT_READONLY == 0 {
+                send_packet_blocking(
+                    stream,
+                    &Packet {
+                        typ: MSG_CONTENT,
+                        payload: buf[..n].to_vec(),
+                    },
+                )?;
+            }
+        }
+    }
+}
+
+fn dump_session(name: &str, max_bytes: usize, max_lines: usize) -> io::Result<()> {
+    let mut stream = connect_session(name)?;
+    let _pid = recv_packet_blocking(&mut stream)?;
+    send_packet_blocking(
+        &mut stream,
+        &Packet {
+            typ: MSG_DUMP,
+            payload: Vec::new(),
+        },
+    )?;
+    let mut out = Vec::new();
+    loop {
+        let pkt = recv_packet_blocking(&mut stream)?;
+        match pkt.typ {
+            MSG_CONTENT => out.extend_from_slice(&pkt.payload),
+            MSG_DUMP_END => break,
+            _ => {}
+        }
+    }
+    let mut start = 0;
+    if max_bytes != 0 && max_bytes < out.len() {
+        start = out.len() - max_bytes;
+    }
+    if max_lines != 0 {
+        start += tail_line_start(&out[start..], max_lines);
+    }
+    io::stdout().write_all(&out[start..])?;
+    Ok(())
+}
+
+fn tail_line_start(buf: &[u8], lines: usize) -> usize {
+    if lines == 0 || buf.is_empty() {
+        return 0;
+    }
+    let mut pos = buf.len();
+    if pos > 0 && buf[pos - 1] == b'\n' {
+        pos -= 1;
+    }
+    let mut found = 0;
+    while pos > 0 {
+        pos -= 1;
+        if buf[pos] == b'\n' {
+            found += 1;
+            if found == lines {
+                return pos + 1;
+            }
+        }
+    }
+    0
+}
+
+fn send_keys_session(name: &str, keys: &[String], literal: bool) -> io::Result<()> {
+    let mut stream = connect_session(name)?;
+    let _pid = recv_packet_blocking(&mut stream)?;
+    let mut bytes = Vec::new();
+    for (idx, key) in keys.iter().enumerate() {
+        if literal {
+            if idx > 0 {
+                bytes.push(b' ');
+            }
+            bytes.extend_from_slice(key.as_bytes());
+        } else if let Some(encoded) = key_token_bytes(key) {
+            bytes.extend_from_slice(&encoded);
+        } else {
+            bytes.extend_from_slice(key.as_bytes());
+        }
+    }
+    for chunk in bytes.chunks(MAX_PAYLOAD) {
+        send_packet_blocking(
+            &mut stream,
+            &Packet {
+                typ: MSG_SEND_KEYS,
+                payload: chunk.to_vec(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn key_token_bytes(token: &str) -> Option<Vec<u8>> {
+    Some(match token {
+        "Enter" | "Return" | "C-m" => b"\r".to_vec(),
+        "Tab" | "C-i" => b"\t".to_vec(),
+        "Esc" | "Escape" => b"\x1b".to_vec(),
+        "Space" => b" ".to_vec(),
+        "Backspace" | "BSpace" => vec![0x7f],
+        "Delete" => b"\x1b[3~".to_vec(),
+        "Insert" => b"\x1b[2~".to_vec(),
+        "Up" => b"\x1b[A".to_vec(),
+        "Down" => b"\x1b[B".to_vec(),
+        "Right" => b"\x1b[C".to_vec(),
+        "Left" => b"\x1b[D".to_vec(),
+        "Home" => b"\x1b[H".to_vec(),
+        "End" => b"\x1b[F".to_vec(),
+        "PageUp" => b"\x1b[5~".to_vec(),
+        "PageDown" => b"\x1b[6~".to_vec(),
+        _ if token.starts_with("C-") && token.len() == 3 => vec![token.as_bytes()[2] & 0x1f],
+        _ if token.starts_with('^') && token.len() == 2 => vec![token.as_bytes()[1] & 0x1f],
+        _ => return None,
+    })
+}
+
+fn list_sessions() -> io::Result<()> {
+    let base = socket_base_dir()?;
+    let host = hostname();
+    println!("Active sessions (on host {host})");
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(&format!("@{host}")) {
+            continue;
+        }
+        let session = name.trim_end_matches(&format!("@{host}"));
+        if let Ok(mut stream) = UnixStream::connect(entry.path())
+            && let Ok(pkt) = recv_packet_blocking(&mut stream)
+            && pkt.typ == MSG_PID
+        {
+            let pid = read_u64(&pkt.payload).unwrap_or(0);
+            println!("  ?\t {pid}\t{session}");
+        }
+    }
+    Ok(())
+}
+
+fn packet_bytes(pkt: &Packet) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + pkt.payload.len());
+    out.extend_from_slice(&pkt.typ.to_ne_bytes());
+    out.extend_from_slice(&(pkt.payload.len() as u32).to_ne_bytes());
+    out.extend_from_slice(&pkt.payload);
+    out
+}
+
+fn send_packet_blocking(stream: &mut UnixStream, pkt: &Packet) -> io::Result<()> {
+    stream.write_all(&packet_bytes(pkt))
+}
+
+fn send_packet_nonblocking(client: &mut Client, pkt: &Packet) -> io::Result<()> {
+    match client.stream.write_all(&packet_bytes(pkt)) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn recv_packet_blocking(stream: &mut UnixStream) -> io::Result<Packet> {
+    let mut hdr = [0u8; 8];
+    stream.read_exact(&mut hdr)?;
+    let typ = u32::from_ne_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let len = u32::from_ne_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packet too large",
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok(Packet { typ, payload })
+}
+
+fn pop_packet(buf: &mut Vec<u8>) -> Option<Packet> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let typ = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let len = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    if len > MAX_PAYLOAD {
+        buf.clear();
+        return None;
+    }
+    if buf.len() < 8 + len {
+        return None;
+    }
+    let payload = buf[8..8 + len].to_vec();
+    buf.drain(..8 + len);
+    Some(Packet { typ, payload })
+}
+
+fn read_u32(bytes: &[u8]) -> Option<u32> {
+    (bytes.len() >= 4).then(|| u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64(bytes: &[u8]) -> Option<u64> {
+    (bytes.len() >= 8).then(|| {
+        u64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    })
+}
+
+fn current_winsize() -> libc::winsize {
+    let mut ws = libc::winsize {
+        ws_row: 25,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc != 0 || ws.ws_row == 0 || ws.ws_col == 0 {
+        ws.ws_row = env_u16("LICH_ROWS").unwrap_or(25);
+        ws.ws_col = env_u16("LICH_COLS").unwrap_or(80);
+    }
+    ws
+}
+
+fn env_u16(name: &str) -> Option<u16> {
+    env::var(name).ok()?.parse::<u16>().ok().filter(|&v| v != 0)
+}
+
+fn send_resize(stream: &mut UnixStream) -> io::Result<()> {
+    let ws = current_winsize();
+    let mut payload = Vec::with_capacity(4);
+    payload.extend_from_slice(&ws.ws_row.to_ne_bytes());
+    payload.extend_from_slice(&ws.ws_col.to_ne_bytes());
+    send_packet_blocking(
+        stream,
+        &Packet {
+            typ: MSG_RESIZE,
+            payload,
+        },
+    )
+}
+
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn fd_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+fn fd_write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
+        buf = &buf[n as usize..];
+    }
+    Ok(())
+}
+
+fn exit_status(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        status
+    }
+}
+
+fn redirect_stdio_to_null() {
+    if let Ok(file) = File::options().read(true).write(true).open("/dev/null") {
+        let fd = file.as_raw_fd();
+        unsafe {
+            libc::dup2(fd, libc::STDIN_FILENO);
+            libc::dup2(fd, libc::STDOUT_FILENO);
+            libc::dup2(fd, libc::STDERR_FILENO);
+        }
+    }
+}
+
+fn isatty(fd: RawFd) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+struct RawMode {
+    saved: Option<libc::termios>,
+}
+
+impl RawMode {
+    fn enter(passthrough: bool) -> io::Result<Self> {
+        if passthrough || !isatty(libc::STDIN_FILENO) {
+            return Ok(Self { saved: None });
+        }
+        let mut term: libc::termios = unsafe { mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } != 0 {
+            return Ok(Self { saved: None });
+        }
+        let saved = term;
+        term.c_iflag &= !(libc::IGNBRK
+            | libc::BRKINT
+            | libc::PARMRK
+            | libc::ISTRIP
+            | libc::INLCR
+            | libc::IGNCR
+            | libc::ICRNL
+            | libc::IXON
+            | libc::IXOFF);
+        term.c_oflag &= !libc::OPOST;
+        term.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
+        term.c_cflag &= !(libc::CSIZE | libc::PARENB);
+        term.c_cflag |= libc::CS8;
+        term.c_cc[libc::VMIN] = 1;
+        term.c_cc[libc::VTIME] = 0;
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term);
+        }
+        print!("\x1b[H");
+        let _ = io::stdout().flush();
+        Ok(Self { saved: Some(saved) })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &saved);
+            }
+            print!("\x1b[?25h");
+            let _ = io::stdout().flush();
+        }
+    }
+}
+
+fn info(opts: &Opts, name: &str, msg: &str) {
+    if !opts.quiet {
+        eprintln!("lich: {name}: {msg}\r");
+    }
+}

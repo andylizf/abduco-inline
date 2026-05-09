@@ -37,12 +37,13 @@ chmod +x lich
 sudo mv lich /usr/local/bin/
 ```
 
-Or build from source (requires a C compiler, no other dependencies):
+Or build from source (requires Rust):
 
 ```sh
 git clone https://github.com/andylizf/lich
 cd lich
-./configure && make && sudo make install
+cargo build --release
+sudo install -m 755 target/release/lich /usr/local/bin/lich
 ```
 
 ## Usage
