@@ -81,7 +81,11 @@ start_shell() {
 
 run "nonblocking write_all returns on EAGAIN"
 srcroot="$(cd "$(dirname "$0")/.." && pwd)"
-cc ${CFLAGS:-} -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -DNDEBUG \
+darwin_cflags=()
+if [[ "$(uname -s)" == "Darwin" ]]; then
+	darwin_cflags=(-D_DARWIN_C_SOURCE)
+fi
+cc ${CFLAGS:-} -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 "${darwin_cflags[@]}" -DNDEBUG \
 	-DVERSION=\"test\" -I "$srcroot/c" "$srcroot/tests/write_all_nonblock.c" -lc -lutil \
 	-o "$tmpdir/write_all_nonblock"
 if ! run_with_timeout 3 "$tmpdir/write_all_nonblock"; then
