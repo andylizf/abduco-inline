@@ -63,8 +63,22 @@ dump_pair() {
 	"$R_LICH" -d "$@" "$prefix-r-$name" > "$tmpdir/r-$label.out"
 	normalize "$tmpdir/c-$label.out" > "$tmpdir/c-$label.norm"
 	normalize "$tmpdir/r-$label.out" > "$tmpdir/r-$label.norm"
-	diff -u "$tmpdir/c-$label.norm" "$tmpdir/r-$label.norm" > "$tmpdir/$label.diff" ||
+	if ! diff -u "$tmpdir/c-$label.norm" "$tmpdir/r-$label.norm" > "$tmpdir/$label.diff"; then
+		cat "$tmpdir/$label.diff" >&2
 		fail "C/Rust dump mismatch for $label; see $tmpdir/$label.diff"
+	fi
+}
+
+wait_dump_contains() {
+	local bin="$1" sess="$2" needle="$3" out="$4"
+	for _ in $(seq 1 30); do
+		"$bin" -d -L 120 "$sess" > "$out"
+		if grep -a -q -- "$needle" "$out"; then
+			return 0
+		fi
+		sleep 0.2
+	done
+	return 1
 }
 
 run "missing command fails before reporting session created"
@@ -91,6 +105,10 @@ pass "no-tty winsize parity"
 
 run "dump tail parity"
 start_pair tail 'for i in $(seq 1 60); do printf "PARITY_TAIL_%03d\n" "$i"; done'
+wait_dump_contains "$C_LICH" "$prefix-c-tail" "PARITY_TAIL_060" "$tmpdir/c-tail-wait.out" ||
+	fail "C tail producer did not reach PARITY_TAIL_060"
+wait_dump_contains "$R_LICH" "$prefix-r-tail" "PARITY_TAIL_060" "$tmpdir/r-tail-wait.out" ||
+	fail "Rust tail producer did not reach PARITY_TAIL_060"
 dump_pair tail tail-full
 dump_pair tail tail-lines -L 7
 dump_pair tail tail-bytes -N 180
