@@ -350,6 +350,121 @@ else
 fi
 pass "long literal send splits across packets"
 
+run "interactive attach timing matrix"
+attach_matrix_sess="$prefix-attach-matrix"
+attach_matrix_script="$tmpdir/attach-matrix.sh"
+cat > "$attach_matrix_script" <<'EOF'
+printf 'ATTACH_MATRIX_BOOT\n'
+for i in $(seq 1 160); do
+	printf 'ATTACH_MATRIX_TICK_%03d\n' "$i"
+	sleep 0.01
+done
+printf 'ATTACH_MATRIX_READY\n'
+exec sh
+EOF
+"$ABDUCO" -n "$attach_matrix_sess" sh "$attach_matrix_script"
+python3 - "$ABDUCO" "$attach_matrix_sess" "$tmpdir" <<'PYEOF'
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+abduco, sess, tmpdir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def attach_once(idx):
+    master, slave = pty.openpty()
+    client = subprocess.Popen(
+        [abduco, "-A", sess],
+        stdin=slave,
+        stdout=slave,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+    )
+    os.close(slave)
+    out = b""
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        r, _, _ = select.select([master], [], [], 0.05)
+        if r:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if b"ATTACH_MATRIX_" in out:
+                break
+    client.terminate()
+    try:
+        client.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        client.kill()
+        client.wait(timeout=1)
+    err = client.stderr.read() or b""
+    os.close(master)
+    with open(os.path.join(tmpdir, f"attach-matrix-{idx}.out"), "wb") as f:
+        f.write(out)
+    if b"I/O errors" in err or b"I/O error" in err:
+        sys.stderr.buffer.write(err)
+        raise SystemExit(f"attach {idx} reported I/O error")
+    if b"ATTACH_MATRIX_" not in out:
+        raise SystemExit(f"attach {idx} did not replay live output")
+
+for i, delay in enumerate([0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.4, 2.0], 1):
+    time.sleep(delay)
+    attach_once(i)
+PYEOF
+"$ABDUCO" -d -L 80 "$attach_matrix_sess" > "$tmpdir/attach-matrix-final.out"
+assert_contains "ATTACH_MATRIX_READY" "$tmpdir/attach-matrix-final.out"
+pass "interactive attach timing matrix"
+
+run "attach dump send timing matrix"
+matrix_sess="$prefix-matrix"
+matrix_out="$tmpdir/matrix.out"
+matrix_script="$tmpdir/matrix.sh"
+cat > "$matrix_script" <<'EOF'
+printf 'MATRIX_BOOT\n'
+for i in $(seq 1 120); do printf 'MATRIX_START_%03d\n' "$i"; done
+i=0
+while [ "$i" -lt 80 ]; do
+	printf 'MATRIX_TICK_%03d\n' "$i"
+	i=$((i + 1))
+	sleep 0.02
+done
+printf 'MATRIX_READY\n'
+exec sh
+EOF
+"$ABDUCO" -n "$matrix_sess" sh "$matrix_script"
+sleep 0.05
+for i in $(seq 1 4); do
+	if ! run_with_timeout 3 "$ABDUCO" -d -L 20 "$matrix_sess" > "$tmpdir/matrix-early-$i.out"; then
+		fail "early dump $i timed out"
+	fi
+done
+sleep 2
+"$ABDUCO" -d -L 260 "$matrix_sess" > "$matrix_out"
+assert_contains "MATRIX_BOOT" "$matrix_out"
+assert_contains "MATRIX_START_120" "$matrix_out"
+assert_contains "MATRIX_TICK_079" "$matrix_out"
+assert_contains "MATRIX_READY" "$matrix_out"
+for i in $(seq 1 30); do
+	"$ABDUCO" -K "$matrix_sess" "echo MATRIX_SEND_$i" Enter
+done
+sleep 0.8
+"$ABDUCO" -d -L 120 "$matrix_sess" > "$matrix_out"
+assert_contains "MATRIX_SEND_1" "$matrix_out"
+assert_contains "MATRIX_SEND_30" "$matrix_out"
+for i in $(seq 1 8); do
+	if ! run_with_timeout 3 "$ABDUCO" -d -L 40 "$matrix_sess" > "$tmpdir/matrix-repeat-$i.out"; then
+		fail "repeat dump $i timed out"
+	fi
+	assert_contains "MATRIX_SEND_30" "$tmpdir/matrix-repeat-$i.out"
+done
+pass "attach dump send timing matrix"
+
 run "invalid dump tail option combination fails"
 sess="$prefix-invalid"
 start_shell "$sess" 'printf "READY_INVALID\n"'
