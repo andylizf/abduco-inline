@@ -156,8 +156,10 @@ static ssize_t write_all(int fd, const char *buf, size_t len) {
 	while (len > 0) {
 		ssize_t res = write(fd, buf, len);
 		if (res < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+			if (errno == EINTR)
 				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return ret - len;
 			return -1;
 		}
 		if (res == 0)
@@ -245,6 +247,21 @@ static size_t parse_size_arg(const char *s) {
 	if (value > SIZE_MAX)
 		usage();
 	return (size_t)value;
+}
+
+static bool parse_winsize_env(const char *name, unsigned short *out) {
+	const char *s = getenv(name);
+	if (!s || !s[0])
+		return false;
+
+	char *end = NULL;
+	errno = 0;
+	unsigned long value = strtoul(s, &end, 10);
+	if (errno || !s[0] || (end && *end) || value == 0 || value > 65535)
+		return false;
+
+	*out = (unsigned short)value;
+	return true;
 }
 
 static bool xsnprintf(char *buf, size_t size, const char *fmt, ...) {
@@ -727,6 +744,8 @@ int main(int argc, char *argv[]) {
 	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &server.winsize) == -1) {
 		server.winsize.ws_col = 80;
 		server.winsize.ws_row = 25;
+		parse_winsize_env("LICH_COLS", &server.winsize.ws_col);
+		parse_winsize_env("LICH_ROWS", &server.winsize.ws_row);
 	}
 
 	server.read_pty = (action == 'n');
