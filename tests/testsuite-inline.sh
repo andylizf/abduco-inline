@@ -57,11 +57,63 @@ assert_no_alt_screen() {
 	fi
 }
 
+run_with_timeout() {
+	local seconds="$1"
+	shift
+	python3 - "$seconds" "$@" <<'PYEOF'
+import subprocess
+import sys
+
+seconds = float(sys.argv[1])
+cmd = sys.argv[2:]
+try:
+    raise SystemExit(subprocess.run(cmd, timeout=seconds).returncode)
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+PYEOF
+}
+
 start_shell() {
 	local sess="$1" prelude="$2"
 	"$ABDUCO" -n "$sess" sh -lc "$prelude; exec sh"
 	sleep 0.3
 }
+
+run "nonblocking write_all returns on EAGAIN"
+srcroot="$(cd "$(dirname "$0")/.." && pwd)"
+cc ${CFLAGS:-} -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -DNDEBUG \
+	-DVERSION=\"test\" -I "$srcroot/c" "$srcroot/tests/write_all_nonblock.c" -lc -lutil \
+	-o "$tmpdir/write_all_nonblock"
+if ! run_with_timeout 3 "$tmpdir/write_all_nonblock"; then
+	fail "write_all did not return cleanly when a nonblocking socket was full"
+fi
+pass "nonblocking write_all returns on EAGAIN"
+
+run "no-tty fallback winsize is configurable"
+sess="$prefix-winsize"
+python3 - "$ABDUCO" "$sess" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+abduco, sess = sys.argv[1], sys.argv[2]
+env = os.environ.copy()
+env["LICH_ROWS"] = "40"
+env["LICH_COLS"] = "132"
+subprocess.run(
+    [abduco, "-n", sess, "sh", "-lc", "stty size; exec sh"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    env=env,
+    timeout=5,
+    check=True,
+)
+PYEOF
+sleep 0.3
+"$ABDUCO" -d "$sess" > "$tmpdir/winsize.out"
+assert_contains "40 132" "$tmpdir/winsize.out"
+pass "no-tty fallback winsize is configurable"
 
 run "dump tail bytes and lines"
 sess="$prefix-tail"
