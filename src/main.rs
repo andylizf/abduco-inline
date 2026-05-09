@@ -364,6 +364,18 @@ unsafe fn run_server(
     startup_fd: RawFd,
 ) -> io::Result<()> {
     let mut master: libc::c_int = -1;
+    #[cfg(target_os = "macos")]
+    let mut winsize_for_forkpty = winsize;
+    #[cfg(target_os = "macos")]
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut winsize_for_forkpty,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
     let pid = unsafe {
         libc::forkpty(
             &mut master,
