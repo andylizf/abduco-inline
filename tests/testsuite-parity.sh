@@ -137,9 +137,10 @@ run "-A create-if-missing parity"
 "$C_LICH" -A "$prefix-c-create-a" sh -lc 'printf "PARITY_A_CREATE\n"; exec sh' >/dev/null 2>&1 || true
 "$R_LICH" -A "$prefix-r-create-a" sh -lc 'printf "PARITY_A_CREATE\n"; exec sh' >/dev/null 2>&1 || true
 sleep 0.4
-dump_pair create-a create-a -L 20
-assert_contains "PARITY_A_CREATE" "$tmpdir/c-create-a.norm"
-assert_contains "PARITY_A_CREATE" "$tmpdir/r-create-a.norm"
+"$C_LICH" -d -L 20 "$prefix-c-create-a" > "$tmpdir/c-create-a.out"
+"$R_LICH" -d -L 20 "$prefix-r-create-a" > "$tmpdir/r-create-a.out"
+assert_contains "PARITY_A_CREATE" "$tmpdir/c-create-a.out"
+assert_contains "PARITY_A_CREATE" "$tmpdir/r-create-a.out"
 pass "-A create-if-missing parity"
 
 run "read-only attach blocks stdin parity"
