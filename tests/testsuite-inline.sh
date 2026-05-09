@@ -115,6 +115,76 @@ sleep 0.3
 assert_contains "40 132" "$tmpdir/winsize.out"
 pass "no-tty fallback winsize is configurable"
 
+run "attach pty resize updates child winsize"
+resize_sock="$tmpdir/resize.sock"
+python3 - "$ABDUCO" "$resize_sock" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+abduco, sess = sys.argv[1], sys.argv[2]
+env = os.environ.copy()
+env["LICH_ROWS"] = "25"
+env["LICH_COLS"] = "80"
+subprocess.run(
+    [abduco, "-n", sess, "sh", "-lc", "stty size; exec sh"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    env=env,
+    timeout=5,
+    check=True,
+)
+PYEOF
+sleep 0.3
+python3 - "$ABDUCO" "$resize_sock" <<'PYEOF'
+import fcntl
+import os
+import pty
+import select
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+abduco, sess = sys.argv[1], sys.argv[2]
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
+client = subprocess.Popen(
+    [abduco, "-A", sess],
+    stdin=slave,
+    stdout=slave,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+)
+os.close(slave)
+deadline = time.monotonic() + 3
+while time.monotonic() < deadline:
+    r, _, _ = select.select([master], [], [], 0.1)
+    if r:
+        try:
+            os.read(master, 4096)
+        except OSError:
+            break
+    else:
+        time.sleep(0.1)
+        break
+client.terminate()
+try:
+    client.wait(timeout=1)
+except subprocess.TimeoutExpired:
+    client.kill()
+os.close(master)
+PYEOF
+sleep 0.3
+"$ABDUCO" -K -x "$resize_sock" $'stty size\n'
+sleep 0.3
+"$ABDUCO" -d -L 20 "$resize_sock" > "$tmpdir/resize.out"
+assert_contains "25 80" "$tmpdir/resize.out"
+assert_contains "45 140" "$tmpdir/resize.out"
+pass "attach pty resize updates child winsize"
+
 run "dump tail bytes and lines"
 sess="$prefix-tail"
 start_shell "$sess" 'for i in $(seq 1 30); do printf "TAIL_LINE_%03d\n" "$i"; done'
@@ -260,6 +330,113 @@ sleep 0.2
 assert_no_alt_screen "$dump_out"
 assert_no_alt_screen "$key_out"
 pass "no alt-screen escapes from attach dump send"
+
+run "raw blocked attach client does not stop pty drain"
+sess="$prefix-raw-blocked"
+raw_sock="$tmpdir/raw-blocked.sock"
+"$ABDUCO" -n "$raw_sock" sh -lc 'printf "READY_RAW_BLOCKED\n"; exec sh'
+sleep 0.3
+raw_client_pid_file="$tmpdir/raw-client.pid"
+python3 - "$raw_sock" "$raw_client_pid_file" <<'PYEOF' &
+import os
+import socket
+import struct
+import sys
+import time
+
+sock_path, pidfile = sys.argv[1], sys.argv[2]
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise SystemExit(2)
+        buf += chunk
+    return buf
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+hdr = recv_exact(s, 8)
+msg_type, msg_len = struct.unpack("@II", hdr)
+if msg_type != 5:
+    raise SystemExit(3)
+if msg_len:
+    recv_exact(s, msg_len)
+
+attach_payload = struct.pack("@I", 0)
+s.sendall(struct.pack("@II", 1, len(attach_payload)) + attach_payload)
+with open(pidfile, "w", encoding="ascii") as f:
+    f.write(str(os.getpid()))
+
+# Keep the attached client alive but do not read any replay or pty output.
+time.sleep(30)
+PYEOF
+raw_client_parent=$!
+sleep 0.5
+"$ABDUCO" -K -x "$raw_sock" $'python3 - <<'"'"'PY'"'"'\nimport sys\nfor i in range(600000):\n    print(f"RAW_BLOCK_FILL_{i:06d}")\nprint("RAW_BLOCKED_DONE")\nsys.stdout.flush()\nPY\n'
+sleep 1
+if ! run_with_timeout 8 "$ABDUCO" -d -L 80 "$raw_sock" > "$tmpdir/raw-blocked.out"; then
+	kill "$raw_client_parent" >/dev/null 2>&1 || true
+	if [[ -s "$raw_client_pid_file" ]]; then
+		kill "$(cat "$raw_client_pid_file")" >/dev/null 2>&1 || true
+	fi
+	fail "dump timed out with a raw blocked attached client"
+fi
+kill "$raw_client_parent" >/dev/null 2>&1 || true
+if [[ -s "$raw_client_pid_file" ]]; then
+	kill "$(cat "$raw_client_pid_file")" >/dev/null 2>&1 || true
+fi
+assert_contains "RAW_BLOCKED_DONE" "$tmpdir/raw-blocked.out"
+pass "raw blocked attach client does not stop pty drain"
+
+run "real blocked attach client does not stop later dump"
+real_sock="$tmpdir/real-blocked.sock"
+"$ABDUCO" -n "$real_sock" sh -lc 'printf "READY_REAL_BLOCKED\n"; exec sh'
+sleep 0.3
+real_client_pid_file="$tmpdir/real-client.pid"
+python3 - "$ABDUCO" "$real_sock" "$real_client_pid_file" <<'PYEOF' &
+import subprocess
+import sys
+import time
+
+abduco, sess, pidfile = sys.argv[1], sys.argv[2], sys.argv[3]
+client = subprocess.Popen(
+    [abduco, "-A", sess],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+)
+with open(pidfile, "w", encoding="ascii") as f:
+    f.write(str(client.pid))
+try:
+    time.sleep(30)
+finally:
+    if client.stdin:
+        client.stdin.close()
+    client.terminate()
+    try:
+        client.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        client.kill()
+PYEOF
+real_client_parent=$!
+sleep 0.5
+"$ABDUCO" -K -x "$real_sock" $'python3 - <<'"'"'PY'"'"'\nimport sys\nfor i in range(600000):\n    print(f"REAL_BLOCK_FILL_{i:06d}")\nprint("REAL_BLOCKED_DONE")\nsys.stdout.flush()\nPY\n'
+sleep 1
+if ! run_with_timeout 8 "$ABDUCO" -d -L 80 "$real_sock" > "$tmpdir/real-blocked.out"; then
+	kill "$real_client_parent" >/dev/null 2>&1 || true
+	if [[ -s "$real_client_pid_file" ]]; then
+		kill "$(cat "$real_client_pid_file")" >/dev/null 2>&1 || true
+	fi
+	fail "dump timed out with a real blocked attach client"
+fi
+kill "$real_client_parent" >/dev/null 2>&1 || true
+if [[ -s "$real_client_pid_file" ]]; then
+	kill "$(cat "$real_client_pid_file")" >/dev/null 2>&1 || true
+fi
+assert_contains "REAL_BLOCKED_DONE" "$tmpdir/real-blocked.out"
+pass "real blocked attach client does not stop later dump"
 
 echo "$tests_ok/$tests_run tests passed"
 [[ "$tests_ok" -eq "$tests_run" ]]
