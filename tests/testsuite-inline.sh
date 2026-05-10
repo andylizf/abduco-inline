@@ -837,9 +837,11 @@ pass "MSG_EXIT delivered under send-buffer pressure"
 # quests/status.py expects (and what the C abduco implementation does).
 # This test creates a name-based session (so it lands in the lich
 # directory and shows up in `lich` list output) instead of the
-# path-based prefix used by other tests.
+# path-based prefix used by other tests. Keep the name very short:
+# macOS sockaddr_un.sun_path caps at ~104 bytes and CI runner hostnames
+# (appended as @hostname) eat a chunk of that budget.
 run "list output is parseable as 4+ fields"
-list_sess="lich_test_list_fields_$$"
+list_sess="lit_$$"
 "$ABDUCO" -n "$list_sess" sh -c 'printf "READY_LIST\n"; exec sh'
 sleep 0.3
 "$ABDUCO" > "$tmpdir/list.out"
