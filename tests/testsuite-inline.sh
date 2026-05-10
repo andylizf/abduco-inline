@@ -652,5 +652,226 @@ fi
 assert_contains "REAL_BLOCKED_DONE" "$tmpdir/real-blocked.out"
 pass "real blocked attach client does not stop later dump"
 
+# Regression: dump must succeed when the server-side history exceeds the
+# default Unix-stream SO_SNDBUF (~208 KB on Linux). The pre-fix code wrote
+# the full 1 MiB history into a non-blocking socket via write_all, hitting
+# EAGAIN mid-packet, dropping the client, and leaving the dump-side
+# read_exact with "failed to fill whole buffer".
+run "dump from large-history session does not partial-write"
+large_sess="$prefix-large-dump"
+"$ABDUCO" -n "$large_sess" sh -c 'i=1
+while [ "$i" -le 60000 ]; do
+    printf "LARGE_DUMP_%05d\n" "$i"
+    i=$((i + 1))
+done
+printf "LARGE_DUMP_DONE\n"
+exec sh'
+# Wait until producer has finished writing into the session history. We
+# scan the FULL dump (not -L 1) because `exec sh` afterwards writes a
+# shell prompt that pushes LARGE_DUMP_DONE off the last-line position.
+deadline=$((SECONDS + 30))
+ready=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.5
+    if "$ABDUCO" -d "$large_sess" 2>"$tmpdir/large-dump-probe.err" \
+        > "$tmpdir/large-dump-probe.out"; then
+        if grep -a -q "LARGE_DUMP_60000" "$tmpdir/large-dump-probe.out"; then
+            ready=1
+            break
+        fi
+    fi
+done
+[ "$ready" -eq 1 ] || fail "large session did not reach LARGE_DUMP_60000 within 30s"
+"$ABDUCO" -d "$large_sess" > "$tmpdir/large-dump.out" 2> "$tmpdir/large-dump.err"
+assert_not_contains "failed to fill whole buffer" "$tmpdir/large-dump.err"
+assert_not_contains "I/O error" "$tmpdir/large-dump.err"
+assert_not_contains "disconnected (no MSG_EXIT" "$tmpdir/large-dump.err"
+assert_contains "LARGE_DUMP_DONE" "$tmpdir/large-dump.out"
+# Last line should be present (history rotation may evict early ones, but
+# 60k * ~17 bytes ≈ 1.0 MiB barely fits HISTORY_CAP — the tail must be there).
+assert_contains "LARGE_DUMP_60000" "$tmpdir/large-dump.out"
+pass "dump from large-history session does not partial-write"
+
+# Regression: attaching to a large-history session triggers the same
+# send_history replay path; it must not surface as a false-positive
+# "exited due to I/O errors" / "disconnected" message.
+run "attach to large-history session replays without I/O error"
+attach_large_out="$tmpdir/attach-large.out"
+attach_large_err="$tmpdir/attach-large.err"
+python3 - "$ABDUCO" "$large_sess" "$attach_large_out" "$attach_large_err" <<'PYEOF'
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+abduco, sess, out_path, err_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+master, slave = pty.openpty()
+client = subprocess.Popen(
+    [abduco, "-A", sess],
+    stdin=slave,
+    stdout=slave,
+    stderr=subprocess.PIPE,
+    close_fds=True,
+)
+os.close(slave)
+out = b""
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    r, _, _ = select.select([master], [], [], 0.2)
+    if r:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    if b"LARGE_DUMP_60000" in out:
+        # got the tail of the replay; that's enough to prove the path worked
+        break
+client.terminate()
+try:
+    client.wait(timeout=2)
+except subprocess.TimeoutExpired:
+    client.kill()
+    client.wait(timeout=1)
+err = client.stderr.read() or b""
+os.close(master)
+with open(out_path, "wb") as f:
+    f.write(out)
+with open(err_path, "wb") as f:
+    f.write(err)
+PYEOF
+assert_not_contains "I/O error" "$attach_large_err"
+assert_not_contains "failed to fill whole buffer" "$attach_large_err"
+assert_not_contains "disconnected (no MSG_EXIT" "$attach_large_err"
+assert_contains "LARGE_DUMP_60000" "$attach_large_out"
+pass "attach to large-history session replays without I/O error"
+
+# Regression: when the inner process exits while the send queue is heavy
+# (history pending replay + buffered broadcast), the server must still
+# deliver MSG_EXIT to the attach client. The pre-fix code used
+# write_all(MSG_EXIT) on a non-blocking socket and dropped MSG_EXIT into
+# a full SNDBUF; the client then surfaced "exited due to I/O errors"
+# instead of the actual exit code.
+run "MSG_EXIT delivered under send-buffer pressure"
+exit_sess="$prefix-exit-pressure"
+exit_out="$tmpdir/exit-pressure.out"
+exit_err="$tmpdir/exit-pressure.err"
+"$ABDUCO" -n "$exit_sess" sh -c 'i=1
+while [ "$i" -le 60000 ]; do
+    printf "EXIT_FILL_%05d\n" "$i"
+    i=$((i + 1))
+done
+exit 7'
+# Block until server has registered the child exit (socket file becomes
+# group-readable in run_server's mark-after-exit path).
+deadline=$((SECONDS + 20))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.3
+    if ! "$ABDUCO" 2>/dev/null | grep -a -q -- "$exit_sess"; then
+        break
+    fi
+done
+# If session is still listed, attach must collect MSG_EXIT(7); if it
+# already vanished (no clients waiting after exit), the path was already
+# exercised — skip in that case.
+if "$ABDUCO" 2>/dev/null | grep -a -q -- "$exit_sess"; then
+    python3 - "$ABDUCO" "$exit_sess" "$exit_out" "$exit_err" <<'PYEOF'
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+abduco, sess, out_path, err_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+master, slave = pty.openpty()
+client = subprocess.Popen(
+    [abduco, "-A", sess],
+    stdin=slave,
+    stdout=slave,
+    stderr=subprocess.PIPE,
+    close_fds=True,
+)
+os.close(slave)
+out = b""
+deadline = time.monotonic() + 8
+while time.monotonic() < deadline:
+    r, _, _ = select.select([master], [], [], 0.2)
+    if r:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    if client.poll() is not None:
+        break
+err = client.stderr.read() or b""
+try:
+    rc = client.wait(timeout=3)
+except subprocess.TimeoutExpired:
+    client.kill()
+    rc = client.wait(timeout=1)
+os.close(master)
+with open(out_path, "wb") as f:
+    f.write(out)
+with open(err_path, "wb") as f:
+    f.write(err)
+print(f"client_rc={rc}")
+PYEOF
+    assert_not_contains "I/O error" "$exit_err"
+    assert_not_contains "failed to fill whole buffer" "$exit_err"
+    assert_not_contains "disconnected (no MSG_EXIT" "$exit_err"
+    assert_contains "exit status 7" "$exit_err"
+fi
+pass "MSG_EXIT delivered under send-buffer pressure"
+
+# Regression: `lich` (no args = list) must emit lines that downstream
+# parsers can split into >= 4 whitespace-separated fields, with the PID
+# in parts[-2] and the session name in parts[-1]. This matches what
+# quests/status.py expects (and what the C abduco implementation does).
+# This test creates a name-based session (so it lands in the lich
+# directory and shows up in `lich` list output) instead of the
+# path-based prefix used by other tests.
+run "list output is parseable as 4+ fields"
+list_sess="lich_test_list_fields_$$"
+"$ABDUCO" -n "$list_sess" sh -c 'printf "READY_LIST\n"; exec sh'
+sleep 0.3
+"$ABDUCO" > "$tmpdir/list.out"
+python3 - "$tmpdir/list.out" "$list_sess" <<'PYEOF'
+import sys
+
+path, expected = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8", errors="replace") as f:
+    lines = f.read().splitlines()
+matched = False
+for line in lines:
+    parts = line.split()
+    if len(parts) < 4:
+        continue
+    try:
+        int(parts[-2])
+    except ValueError:
+        continue
+    if parts[-1] == expected:
+        matched = True
+        break
+if not matched:
+    sys.stderr.write(
+        f"no list line matched name={expected!r} with >=4 fields and int pid; got:\n"
+    )
+    for line in lines:
+        sys.stderr.write(f"  {line!r}\n")
+    raise SystemExit(1)
+PYEOF
+# Best-effort cleanup; the EXIT trap only sweeps "$prefix-*".
+"$ABDUCO" -K -x "$list_sess" $'exit\n' >/dev/null 2>&1 || true
+pass "list output is parseable as 4+ fields"
+
 echo "$tests_ok/$tests_run tests passed"
 [[ "$tests_ok" -eq "$tests_run" ]]

@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MSG_CONTENT: u32 = 0;
 const MSG_ATTACH: u32 = 1;
@@ -25,6 +25,15 @@ const CLIENT_READONLY: u32 = 1 << 0;
 const CLIENT_LOWPRIORITY: u32 = 1 << 1;
 const HISTORY_CAP: usize = 1024 * 1024;
 const MAX_PAYLOAD: usize = 4096 - 8;
+// Per-client outbound buffer cap. Linux Unix-stream SO_SNDBUF default is
+// ~208 KB; HISTORY_CAP is 1 MiB; broadcast traffic + replay must coexist for
+// idle attach clients without disconnecting them on a single full-buffer hit.
+// 16 MiB is an inferred cap that covers history replay + a generous broadcast
+// backlog without unbounded growth.
+const SEND_QUEUE_CAP: usize = 16 * 1024 * 1024;
+// Once a client has been queued an MSG_EXIT or MSG_DUMP_END packet, give it
+// up to this long to drain before forcing a disconnect.
+const EXIT_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -62,6 +71,15 @@ struct Client {
     attached: bool,
     flags: u32,
     disconnected: bool,
+    /// Outbound bytes that didn't fit into the kernel send buffer yet.
+    /// We retry these on every server tick instead of disconnecting the
+    /// client mid-packet (which corrupts the wire and surfaces as
+    /// "exited due to I/O errors" on the attach side).
+    send_queue: VecDeque<u8>,
+    /// When set, the client has already been queued a terminal packet
+    /// (MSG_EXIT or MSG_DUMP_END) and should be disconnected as soon as
+    /// the queue drains, or after EXIT_DRAIN_DEADLINE — whichever first.
+    close_after_drain: Option<Instant>,
 }
 
 struct History {
@@ -481,6 +499,8 @@ fn server_loop(
                         attached: false,
                         flags: 0,
                         disconnected: false,
+                        send_queue: VecDeque::new(),
+                        close_after_drain: None,
                     });
                     read_pty = true;
                 }
@@ -523,23 +543,62 @@ fn server_loop(
         for idx in 0..clients.len() {
             read_client_packets(idx, &mut clients, master, child_pid, &history);
         }
-        clients.retain(|c| !c.disconnected);
 
+        // Once the child has exited, queue MSG_EXIT for any client that
+        // hasn't already been scheduled for graceful close. We do NOT
+        // mark the client disconnected here — let try_flush_client drain
+        // the queue first so MSG_EXIT (and any preceding broadcast/replay
+        // backlog) actually reaches the client.
         if let Some(status) = child_exit {
-            if clients.is_empty() {
-                let _ = fs::remove_file(&path);
-                return Ok(());
-            }
+            let payload = (status as u32).to_ne_bytes().to_vec();
             for client in &mut clients {
+                if client.disconnected || client.close_after_drain.is_some() {
+                    continue;
+                }
                 let _ = send_packet_nonblocking(
                     client,
                     &Packet {
                         typ: MSG_EXIT,
-                        payload: (status as u32).to_ne_bytes().to_vec(),
+                        payload: payload.clone(),
                     },
                 );
+                client.close_after_drain = Some(Instant::now());
+            }
+        }
+
+        // Drain pending outbound bytes. Real socket errors (EPIPE,
+        // ECONNRESET, queue overflow, etc.) → mark disconnected; a plain
+        // WouldBlock just leaves bytes in the queue for the next tick.
+        for client in &mut clients {
+            if client.disconnected {
+                continue;
+            }
+            if try_flush_client(client).is_err() {
                 client.disconnected = true;
             }
+        }
+
+        // For graceful-close clients, disconnect once the queue has
+        // drained or EXIT_DRAIN_DEADLINE has elapsed (the latter prevents
+        // a hung peer from pinning the server forever).
+        let now = Instant::now();
+        for client in &mut clients {
+            if client.disconnected {
+                continue;
+            }
+            if let Some(t) = client.close_after_drain
+                && (client.send_queue.is_empty()
+                    || now.duration_since(t) >= EXIT_DRAIN_DEADLINE)
+            {
+                client.disconnected = true;
+            }
+        }
+
+        clients.retain(|c| !c.disconnected);
+
+        if child_exit.is_some() && clients.is_empty() {
+            let _ = fs::remove_file(&path);
+            return Ok(());
         }
 
         std::thread::sleep(Duration::from_millis(5));
@@ -584,7 +643,9 @@ fn read_client_packets(
             }
             MSG_DUMP => {
                 send_history(&mut clients[idx], history, true);
-                clients[idx].disconnected = true;
+                if clients[idx].close_after_drain.is_none() {
+                    clients[idx].close_after_drain = Some(Instant::now());
+                }
             }
             MSG_RESIZE if pkt.payload.len() >= 4 => {
                 let rows = u16::from_ne_bytes([pkt.payload[0], pkt.payload[1]]);
@@ -671,7 +732,11 @@ fn attach_session(name: &str, terminate: bool, opts: &Opts) -> io::Result<()> {
 
     match status {
         ClientStatus::Detached => info(opts, name, "detached"),
-        ClientStatus::IoError => info(opts, name, "exited due to I/O errors"),
+        ClientStatus::IoError => info(
+            opts,
+            name,
+            "disconnected (no MSG_EXIT received; server may still be alive)",
+        ),
         ClientStatus::Exited(code) => {
             info(
                 opts,
@@ -885,10 +950,43 @@ fn list_sessions() -> io::Result<()> {
             && pkt.typ == MSG_PID
         {
             let pid = read_u64(&pkt.payload).unwrap_or(0);
-            println!("  ?\t {pid}\t{session}");
+            // 4-field tab output, matching the C abduco column ordering
+            // expected by quests/status.py and similar parsers:
+            //   STATUS \t START_DATE \t PID \t NAME
+            // After whitespace split parts[-2] must be the PID and
+            // parts[-1] the session name; the START_DATE column is the
+            // mtime of the bound socket file (close enough to abduco's
+            // "started at" semantics for downstream tooling).
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .map(format_iso_local)
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("  ?\t{mtime}\t{pid}\t{session}");
         }
     }
     Ok(())
+}
+
+fn format_iso_local(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { mem::zeroed() };
+    let rc = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if rc.is_null() {
+        return "unknown".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+    )
 }
 
 fn packet_bytes(pkt: &Packet) -> Vec<u8> {
@@ -903,10 +1001,52 @@ fn send_packet_blocking(stream: &mut UnixStream, pkt: &Packet) -> io::Result<()>
     stream.write_all(&packet_bytes(pkt))
 }
 
+/// Queue a packet for the client and try to flush as much as the kernel
+/// send buffer can accept right now. Bytes that don't fit stay in the
+/// per-client queue and are retried by `try_flush_client` on every
+/// server tick. The previous implementation called `write_all` directly
+/// on a non-blocking socket: a `WouldBlock` mid-packet returned `Err`
+/// while leaving partial bytes already on the wire, which the attach
+/// client then read as a corrupted packet — surfacing as
+/// "exited due to I/O errors" or "failed to fill whole buffer".
 fn send_packet_nonblocking(client: &mut Client, pkt: &Packet) -> io::Result<()> {
-    match client.stream.write_all(&packet_bytes(pkt)) {
-        Ok(()) => Ok(()),
-        Err(err) => Err(err),
+    let bytes = packet_bytes(pkt);
+    if client.send_queue.len().saturating_add(bytes.len()) > SEND_QUEUE_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "client send queue overflow",
+        ));
+    }
+    client.send_queue.extend(bytes);
+    try_flush_client(client)
+}
+
+/// Drain whatever already-queued bytes the kernel will accept right now.
+/// Returns `Ok(())` whether the queue was fully flushed or merely paused
+/// at a `WouldBlock`; only real socket errors propagate up.
+fn try_flush_client(client: &mut Client) -> io::Result<()> {
+    loop {
+        let front_len = client.send_queue.as_slices().0.len();
+        if front_len == 0 {
+            return Ok(());
+        }
+        // Borrow a slice of the front segment for the write call.
+        let written = {
+            let front = &client.send_queue.as_slices().0[..front_len];
+            match client.stream.write(front) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "client send returned 0",
+                    ));
+                }
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        };
+        client.send_queue.drain(..written);
     }
 }
 
