@@ -9,7 +9,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigwinch(_sig: libc::c_int) {
+    WINCH_PENDING.store(true, Ordering::Relaxed);
+}
 
 const MSG_CONTENT: u32 = 0;
 const MSG_ATTACH: u32 = 1;
@@ -726,9 +733,15 @@ fn attach_session(name: &str, terminate: bool, opts: &Opts) -> io::Result<()> {
     )?;
     send_resize(&mut stream)?;
 
+    unsafe {
+        libc::signal(libc::SIGWINCH, handle_sigwinch as *const () as libc::sighandler_t);
+    }
     let raw_guard = RawMode::enter(opts.passthrough)?;
     let status = client_loop(&mut stream, opts)?;
     drop(raw_guard);
+    unsafe {
+        libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+    }
 
     match status {
         ClientStatus::Detached => info(opts, name, "detached"),
@@ -778,6 +791,9 @@ fn client_loop(stream: &mut UnixStream, opts: &Opts) -> io::Result<ClientStatus>
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
+                if WINCH_PENDING.swap(false, Ordering::Relaxed) {
+                    send_resize(stream)?;
+                }
                 continue;
             }
             return Err(err);
