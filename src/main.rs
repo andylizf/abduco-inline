@@ -1,21 +1,40 @@
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Set by SIGTERM/SIGINT handlers. server_loop polls this every tick and
+/// initiates graceful shutdown (forwards SIGTERM to the inner process group,
+/// drains client queues, removes the socket file) when true. Replaces the
+/// default `terminate` action which left the socket file orphaned and surfaced
+/// to clients as ECONNREFUSED.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Per-server log path, set by the server child immediately after fork so the
+/// panic hook and signal-triggered shutdown path can write forensic entries
+/// even though stdio is redirected to /dev/null. Format: lines of
+/// `<ISO_TIMESTAMP_UTC> <PID> <KIND> <MSG>\n`. Best-effort: any IO error is
+/// silently dropped to avoid recursive failure.
+static SERVER_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
 extern "C" fn handle_sigwinch(_sig: libc::c_int) {
     WINCH_PENDING.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 const MSG_CONTENT: u32 = 0;
@@ -116,6 +135,195 @@ impl History {
     fn snapshot(&self) -> Vec<u8> {
         self.bytes.iter().copied().collect()
     }
+}
+
+/// Overwrite the server process's own argv so `pkill -f <pattern>` cannot
+/// match user-supplied content (e.g. an agent's bootstrap prompt) that was
+/// passed on the original lich command line. Without this, the prompt sits in
+/// `/proc/<server-pid>/cmdline` and any user-issued `pkill -f <prompt-fragment>`
+/// SIGTERMs the lich server itself (root cause of the
+/// lich-crash-spd-session incident, 2026-05-17). Equivalent in spirit to
+/// tmux's short-and-fixed server argv. Inner forkpty children (e.g. the
+/// codex/claude process) are unaffected; killing those still triggers the
+/// normal child-exit → graceful shutdown path.
+#[cfg(target_os = "linux")]
+fn shorten_server_proctitle(session_name: &str) {
+    let Some((arg_start, arg_end)) = proc_self_argv_region() else {
+        return;
+    };
+    let total_len = arg_end.saturating_sub(arg_start);
+    if total_len < 2 {
+        return;
+    }
+    let title = format!("lich-server[{session_name}]");
+    let bytes = title.as_bytes();
+    let write_len = bytes.len().min(total_len - 1);
+
+    // Zero the entire argv region, then write the new title. Even if the
+    // PR_SET_MM call below is rejected by the container's seccomp profile,
+    // the cmdline content is now NUL-padded after our short title, so
+    // pkill -f against the original prompt will not match.
+    unsafe {
+        std::ptr::write_bytes(arg_start as *mut u8, 0, total_len);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), arg_start as *mut u8, write_len);
+    }
+
+    // Tell the kernel the new arg_end so /proc/<pid>/cmdline reports the
+    // shorter region (cosmetic; PR_SET_MM may require CAP_SYS_RESOURCE which
+    // can be missing inside containers). Failure is non-fatal.
+    let new_arg_end = arg_start + write_len + 1;
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_MM,
+            libc::PR_SET_MM_ARG_END as libc::c_ulong,
+            new_arg_end as libc::c_ulong,
+            0_u64,
+            0_u64,
+        );
+    }
+
+    // Also set the short comm field (15-char limit) so `top`, `ps -o comm`,
+    // and `pkill <name>` (without -f) target the right thing.
+    if let Ok(short) = CString::new("lich-server") {
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_NAME,
+                short.as_ptr() as libc::c_ulong,
+                0_u64,
+                0_u64,
+                0_u64,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_self_argv_region() -> Option<(usize, usize)> {
+    // /proc/self/stat fields per proc(5): pid (1), comm (2, parenthesised and
+    // may contain spaces), state (3), ..., arg_start (48), arg_end (49).
+    // We must locate the last ')' to anchor field 3, because comm can embed
+    // ')' or whitespace if a binary renames itself.
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rfind(')')?;
+    let rest = &stat[after_comm + 1..];
+    let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
+    // After the last ')', index 0 = state (field 3), so arg_start (field 48)
+    // is at index 48 - 3 = 45; arg_end (field 49) at 46.
+    let arg_start = fields.get(45)?.parse::<usize>().ok()?;
+    let arg_end = fields.get(46)?.parse::<usize>().ok()?;
+    if arg_end > arg_start { Some((arg_start, arg_end)) } else { None }
+}
+
+#[cfg(target_os = "macos")]
+fn shorten_server_proctitle(session_name: &str) {
+    // libc 0.2 does not expose setproctitle on Apple targets, so declare it
+    // manually. macOS inherits the BSD setproctitle API.
+    unsafe extern "C" {
+        fn setproctitle(fmt: *const libc::c_char, ...);
+    }
+    let title = match CString::new(format!("lich-server[{session_name}]")) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let fmt = match CString::new("%s") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    unsafe { setproctitle(fmt.as_ptr(), title.as_ptr()) };
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn shorten_server_proctitle(_session_name: &str) {}
+
+/// Derive the per-server log path: `<socket_dir>/<socket_basename>.log`.
+/// For socket `~/.lich/foo@hostname` the log goes to
+/// `~/.lich/foo@hostname.log` (same dir, same permissions model).
+fn derive_server_log_path(socket_path: &Path) -> PathBuf {
+    let mut p = socket_path.to_path_buf();
+    let new_name = match p.file_name().and_then(|n| n.to_str()) {
+        Some(s) => format!("{s}.log"),
+        None => "lich.log".to_string(),
+    };
+    p.set_file_name(new_name);
+    p
+}
+
+/// Best-effort append to the server log. Silent on any IO error to avoid
+/// recursive failures from inside a panic hook or signal-triggered path.
+/// Format: `<ISO_TS_UTC> <PID> <KIND> <MSG>\n`.
+fn server_log(kind: &str, msg: &str) {
+    let Some(log_path) = SERVER_LOG_PATH.get() else {
+        return;
+    };
+    let ts = iso_utc_now();
+    let pid = unsafe { libc::getpid() };
+    let _ = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(log_path)
+        .and_then(|mut f| writeln!(f, "{ts} {pid} {kind} {msg}"));
+}
+
+fn iso_utc_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { mem::zeroed() };
+    let rc = unsafe { libc::gmtime_r(&secs, &mut tm) };
+    if rc.is_null() {
+        return "unknown".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
+}
+
+/// RAII socket-file cleanup. Drop runs on every code path that unwinds:
+/// normal return from server_loop, propagated `?` errors, and Rust panic
+/// unwinds. Does NOT run on `process::exit`, `process::abort`, SIGKILL,
+/// SIGSEGV, SIGBUS, or kernel OOM kill — for those, the next attaching
+/// client's `connect_session` removes the orphan on ECONNREFUSED.
+struct SocketGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl SocketGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Install a panic hook that logs the panic location and payload before the
+/// runtime unwinds. The unwind itself causes `SocketGuard::drop` to fire,
+/// removing the socket file even on a crash.
+fn install_server_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".to_string());
+        let payload = info
+            .payload_as_str()
+            .unwrap_or("<non-string panic payload>");
+        server_log("panic", &format!("at {location} payload={payload}"));
+    }));
 }
 
 fn main() {
@@ -373,11 +581,48 @@ fn create_session(name: &str, cmd: Vec<String>, read_pty: bool, _opts: &Opts) ->
         libc::setsid();
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        // P1: catch SIGTERM/SIGINT so server_loop can run graceful shutdown
+        // (drain client queues, remove socket file) instead of being terminated
+        // mid-write and leaving an orphan socket. Handler only sets an atomic
+        // flag (signal-safe); the loop polls it.
+        libc::signal(
+            libc::SIGTERM,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
     }
-    match unsafe { run_server(listener, path, cmd, winsize, read_pty, sync_pipe[1]) } {
-        Ok(()) => process::exit(0),
-        Err(_) => process::exit(1),
+    // P0: shrink the server's own argv so `pkill -f <prompt>` cannot match.
+    shorten_server_proctitle(name);
+    // P2: set up server-only forensic log and panic hook BEFORE entering the
+    // server loop. Done in this scope so the client/dump/list code paths
+    // (which also run main()) do not install these as side effects.
+    let log_path = derive_server_log_path(&path);
+    let _ = SERVER_LOG_PATH.set(log_path);
+    install_server_panic_hook();
+    server_log(
+        "start",
+        &format!("pid={} session={}", unsafe { libc::getpid() }, name),
+    );
+
+    // SocketGuard owns the socket-file cleanup for every unwind path
+    // (returning Err from run_server, panics). For SIGTERM-initiated graceful
+    // shutdown, server_loop returns Ok(()) and the guard's Drop still removes
+    // the file. process::exit below does NOT run Drop, so we explicitly drop
+    // the guard first.
+    let guard = SocketGuard::new(path.clone());
+    let result = unsafe { run_server(listener, path, cmd, winsize, read_pty, sync_pipe[1]) };
+    let exit_code = match &result {
+        Ok(()) => 0,
+        Err(_) => 1,
+    };
+    if let Err(err) = &result {
+        server_log("exit-error", &format!("{err}"));
     }
+    drop(guard);
+    process::exit(exit_code);
 }
 
 unsafe fn run_server(
@@ -489,6 +734,23 @@ fn server_loop(
     let mut child_exit: Option<i32> = None;
 
     loop {
+        // P1: SIGTERM/SIGINT polling. Set by handle_shutdown_signal in async
+        // context; here we promote it to the same internal state as a child
+        // exit (status 143 = 128 + SIGTERM) and forward SIGTERM to the inner
+        // process group so the user's command also tears down rather than
+        // being reparented to init. The existing close_after_drain machinery
+        // then queues MSG_EXIT, waits up to EXIT_DRAIN_DEADLINE for clients
+        // to drain, and finally returns Ok(()) via the clients.is_empty()
+        // branch below — letting SocketGuard remove the file.
+        if SHUTDOWN_REQUESTED.swap(false, Ordering::Relaxed) && child_exit.is_none() {
+            server_log("shutdown", "signal-requested SIGTERM/SIGINT");
+            unsafe {
+                libc::kill(-child_pid, libc::SIGTERM);
+            }
+            child_exit = Some(128 + libc::SIGTERM);
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o610));
+        }
+
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -499,7 +761,17 @@ fn server_loop(
                             payload: unsafe { (libc::getpid() as u64).to_ne_bytes().to_vec() },
                         },
                     );
-                    stream.set_nonblocking(true)?;
+                    // P2: do not propagate fcntl failures up to run_server
+                    // (which would exit dirty via process::exit(1)). Log and
+                    // drop the offending stream; the server stays alive for
+                    // the other (already-attached) clients.
+                    if let Err(err) = stream.set_nonblocking(true) {
+                        server_log(
+                            "accept-error",
+                            &format!("set_nonblocking failed: {err}"),
+                        );
+                        continue;
+                    }
                     clients.push(Client {
                         stream,
                         buf: Vec::new(),
@@ -603,8 +875,17 @@ fn server_loop(
 
         clients.retain(|c| !c.disconnected);
 
-        if child_exit.is_some() && clients.is_empty() {
-            let _ = fs::remove_file(&path);
+        if let Some(code) = child_exit
+            && clients.is_empty()
+        {
+            server_log(
+                "shutdown",
+                &format!("clean child_exit={code} clients=0"),
+            );
+            // Socket file removal is owned by SocketGuard in create_session;
+            // returning Ok(()) triggers its Drop along the unwind from
+            // run_server. Suppress an extra fs::remove_file here so the
+            // cleanup site stays single-owner.
             return Ok(());
         }
 
