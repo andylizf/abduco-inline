@@ -875,5 +875,87 @@ PYEOF
 "$ABDUCO" -K -x "$list_sess" $'exit\n' >/dev/null 2>&1 || true
 pass "list output is parseable as 4+ fields"
 
+# Regression: the lich server must shorten its own argv via setproctitle so
+# that a `pkill -f <fragment-of-original-command>` cannot match the server
+# process. Without this fix, the bootstrap prompt embedded in the lich
+# command line (e.g. `lich -n NAME claude --agent X <PROMPT>`) sits in
+# /proc/<server-pid>/cmdline and any pkill -f against a prompt fragment
+# delivers SIGTERM to the server, leaving an orphan socket file.
+#
+# We only test the property that matters for safety: a unique sentinel
+# present in the original command line is NOT present in the running
+# server's /proc/<pid>/cmdline. /proc is unavailable on macOS; that case
+# soft-passes since the BSD setproctitle(3) path is exercised separately
+# on macOS CI and we cannot inspect cmdline portably there.
+run "server argv is shortened (no longer contains user command tokens)"
+spt_sess="spt$$"
+spt_sentinel="SPT_SENTINEL_$$"
+"$ABDUCO" -n "$spt_sess" sh -c "printf '%s\\n%s\\n' READY $spt_sentinel; while sleep 60; do :; done"
+sleep 0.4
+host="$(hostname)"
+spt_sock="$HOME/.lich/${spt_sess}@${host}"
+if [[ ! -S "$spt_sock" ]]; then
+    fail "expected socket $spt_sock for setproctitle test"
+fi
+spt_pid=$(pgrep -u "$USER" -f "lich-server\\[${spt_sess}\\]" | head -1)
+if [[ -z "$spt_pid" ]]; then
+    spt_pid=$(fuser "$spt_sock" 2>/dev/null | tr -d ' ' | head -1)
+fi
+[[ -z "$spt_pid" ]] && fail "could not locate server PID for $spt_sess"
+if [[ -r "/proc/${spt_pid}/cmdline" ]]; then
+    spt_cmdline=$(tr '\0' ' ' < "/proc/${spt_pid}/cmdline")
+    if echo "$spt_cmdline" | grep -q "$spt_sentinel"; then
+        fail "server cmdline still contains sentinel $spt_sentinel: $spt_cmdline"
+    fi
+else
+    echo "  note: /proc/${spt_pid}/cmdline unavailable (likely macOS); soft-pass"
+fi
+"$ABDUCO" -K -x "$spt_sess" $'exit\n' >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do
+    [[ ! -S "$spt_sock" ]] && break
+    sleep 0.1
+done
+rm -f "${spt_sock}.log" 2>/dev/null || true
+pass "server argv is shortened (no longer contains user command tokens)"
+
+# Regression: SIGTERM to the server PID must run graceful shutdown that
+# removes the socket file. Without this fix, SIGTERM took the default
+# `terminate` action and left an orphan socket.
+run "SIGTERM triggers graceful shutdown and removes socket"
+sig_sess="sig$$"
+"$ABDUCO" -n "$sig_sess" sh -c 'printf READY\n; while sleep 60; do :; done'
+sleep 0.4
+sig_sock="$HOME/.lich/${sig_sess}@${host}"
+sig_pid=$(pgrep -u "$USER" -f "lich-server\\[${sig_sess}\\]" | head -1)
+if [[ -z "$sig_pid" ]]; then
+    sig_pid=$(fuser "$sig_sock" 2>/dev/null | tr -d ' ' | head -1)
+fi
+[[ -z "$sig_pid" ]] && fail "could not locate server PID for $sig_sess"
+kill -TERM "$sig_pid"
+# Wait up to 6s (EXIT_DRAIN_DEADLINE=5s in src/main.rs + buffer).
+for _ in $(seq 1 60); do
+    kill -0 "$sig_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "$sig_pid" 2>/dev/null; then
+    fail "server PID $sig_pid still alive 6s after SIGTERM"
+fi
+if [[ -S "$sig_sock" ]]; then
+    fail "socket file $sig_sock not removed after SIGTERM graceful shutdown"
+fi
+sig_log="${sig_sock}.log"
+if [[ -f "$sig_log" ]]; then
+    if ! grep -q " start " "$sig_log"; then
+        fail "log file $sig_log missing 'start' entry"
+    fi
+    if ! grep -q " shutdown " "$sig_log"; then
+        fail "log file $sig_log missing 'shutdown' entry"
+    fi
+    rm -f "$sig_log"
+else
+    fail "log file $sig_log not created"
+fi
+pass "SIGTERM triggers graceful shutdown and removes socket"
+
 echo "$tests_ok/$tests_run tests passed"
 [[ "$tests_ok" -eq "$tests_run" ]]
