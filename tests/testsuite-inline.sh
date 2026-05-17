@@ -897,7 +897,14 @@ spt_sock="$HOME/.lich/${spt_sess}@${host}"
 if [[ ! -S "$spt_sock" ]]; then
     fail "expected socket $spt_sock for setproctitle test"
 fi
+# Try multiple PID-lookup strategies so this test works against:
+#   * Linux post-fix: argv was rewritten to "lich-server[<sess>]"
+#   * Linux pre-fix (regression): argv still "lich -n <sess> ..."
+#   * macOS (setproctitle is a deliberate noop): argv still "lich -n ..."
 spt_pid=$(pgrep -u "$USER" -f "lich-server\\[${spt_sess}\\]" | head -1)
+if [[ -z "$spt_pid" ]]; then
+    spt_pid=$(pgrep -u "$USER" -f "lich -n ${spt_sess}" | head -1)
+fi
 if [[ -z "$spt_pid" ]]; then
     spt_pid=$(fuser "$spt_sock" 2>/dev/null | tr -d ' ' | head -1)
 fi
@@ -908,6 +915,9 @@ if [[ -r "/proc/${spt_pid}/cmdline" ]]; then
         fail "server cmdline still contains sentinel $spt_sentinel: $spt_cmdline"
     fi
 else
+    # macOS: /proc not available + setproctitle is noop. Soft-pass the
+    # introspection step; the build itself verifies the cfg-gated code
+    # compiles, which is all we can portably do here.
     echo "  note: /proc/${spt_pid}/cmdline unavailable (likely macOS); soft-pass"
 fi
 "$ABDUCO" -K -x "$spt_sess" $'exit\n' >/dev/null 2>&1 || true
@@ -927,6 +937,9 @@ sig_sess="sig$$"
 sleep 0.4
 sig_sock="$HOME/.lich/${sig_sess}@${host}"
 sig_pid=$(pgrep -u "$USER" -f "lich-server\\[${sig_sess}\\]" | head -1)
+if [[ -z "$sig_pid" ]]; then
+    sig_pid=$(pgrep -u "$USER" -f "lich -n ${sig_sess}" | head -1)
+fi
 if [[ -z "$sig_pid" ]]; then
     sig_pid=$(fuser "$sig_sock" 2>/dev/null | tr -d ' ' | head -1)
 fi
