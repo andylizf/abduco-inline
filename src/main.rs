@@ -214,26 +214,22 @@ fn proc_self_argv_region() -> Option<(usize, usize)> {
     if arg_end > arg_start { Some((arg_start, arg_end)) } else { None }
 }
 
-#[cfg(target_os = "macos")]
-fn shorten_server_proctitle(session_name: &str) {
-    // libc 0.2 does not expose setproctitle on Apple targets, so declare it
-    // manually. macOS inherits the BSD setproctitle API.
-    unsafe extern "C" {
-        fn setproctitle(fmt: *const libc::c_char, ...);
-    }
-    let title = match CString::new(format!("lich-server[{session_name}]")) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let fmt = match CString::new("%s") {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    unsafe { setproctitle(fmt.as_ptr(), title.as_ptr()) };
+#[cfg(not(target_os = "linux"))]
+fn shorten_server_proctitle(_session_name: &str) {
+    // macOS (and other non-Linux Unixes) intentionally noop:
+    //   * macOS does not ship setproctitle(3) in libSystem — Apple did not
+    //     port the BSD API, despite the kernel exposing proc_set_name() for
+    //     the short comm field only (15 bytes, like PR_SET_NAME).
+    //   * Linking a private libbsd / libsetproctitle would force every
+    //     Mac user to install a Homebrew formula just to build lich.
+    //   * The crash this fix targets was reported on Linux containers; macOS
+    //     CI exists only for parity. Leaving this empty keeps macOS users at
+    //     the previous (pre-fix) safety level: vulnerable to pkill -f against
+    //     the original prompt, but no worse than before.
+    // If a macOS-specific path is ever needed, the closest shim is to use
+    // sysctl KERN_PROCNAME + dlsym("setproctitle") from a private framework;
+    // not worth the build-system complexity here.
 }
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn shorten_server_proctitle(_session_name: &str) {}
 
 /// Derive the per-server log path: `<socket_dir>/<socket_basename>.log`.
 /// For socket `~/.lich/foo@hostname` the log goes to
