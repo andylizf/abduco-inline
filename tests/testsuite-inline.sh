@@ -897,18 +897,12 @@ spt_sock="$HOME/.lich/${spt_sess}@${host}"
 if [[ ! -S "$spt_sock" ]]; then
     fail "expected socket $spt_sock for setproctitle test"
 fi
-# Try multiple PID-lookup strategies so this test works against:
-#   * Linux post-fix: argv was rewritten to "lich-server[<sess>]"
-#   * Linux pre-fix (regression): argv still "lich -n <sess> ..."
-#   * macOS (setproctitle is a deliberate noop): argv still "lich -n ..."
-spt_pid=$(pgrep -u "$USER" -f "lich-server\\[${spt_sess}\\]" | head -1)
-if [[ -z "$spt_pid" ]]; then
-    spt_pid=$(pgrep -u "$USER" -f "lich -n ${spt_sess}" | head -1)
-fi
-if [[ -z "$spt_pid" ]]; then
-    spt_pid=$(fuser "$spt_sock" 2>/dev/null | tr -d ' ' | head -1)
-fi
-[[ -z "$spt_pid" ]] && fail "could not locate server PID for $spt_sess"
+# Use lich's own list output to get the PID portably across Linux/macOS
+# (pgrep -u USER takes a username on Linux but a UID on macOS BSD pgrep;
+# fuser also differs between util-linux and BSD). lich list emits 4
+# whitespace-separated fields with PID at parts[-2] and name at parts[-1].
+spt_pid=$("$ABDUCO" 2>/dev/null | awk -v n="$spt_sess" '$NF==n {print $(NF-1)}' | head -1)
+[[ -z "$spt_pid" ]] && fail "could not locate server PID for $spt_sess via lich list"
 if [[ -r "/proc/${spt_pid}/cmdline" ]]; then
     spt_cmdline=$(tr '\0' ' ' < "/proc/${spt_pid}/cmdline")
     if echo "$spt_cmdline" | grep -q "$spt_sentinel"; then
@@ -936,14 +930,8 @@ sig_sess="sig$$"
 "$ABDUCO" -n "$sig_sess" sh -c 'printf READY\n; while sleep 60; do :; done'
 sleep 0.4
 sig_sock="$HOME/.lich/${sig_sess}@${host}"
-sig_pid=$(pgrep -u "$USER" -f "lich-server\\[${sig_sess}\\]" | head -1)
-if [[ -z "$sig_pid" ]]; then
-    sig_pid=$(pgrep -u "$USER" -f "lich -n ${sig_sess}" | head -1)
-fi
-if [[ -z "$sig_pid" ]]; then
-    sig_pid=$(fuser "$sig_sock" 2>/dev/null | tr -d ' ' | head -1)
-fi
-[[ -z "$sig_pid" ]] && fail "could not locate server PID for $sig_sess"
+sig_pid=$("$ABDUCO" 2>/dev/null | awk -v n="$sig_sess" '$NF==n {print $(NF-1)}' | head -1)
+[[ -z "$sig_pid" ]] && fail "could not locate server PID for $sig_sess via lich list"
 kill -TERM "$sig_pid"
 # Wait up to 6s (EXIT_DRAIN_DEADLINE=5s in src/main.rs + buffer).
 for _ in $(seq 1 60); do
