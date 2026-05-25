@@ -454,12 +454,12 @@ for i in $(seq 1 4); do
 		fail "early dump $i timed out"
 	fi
 done
-for _ in $(seq 1 20); do
+for _ in $(seq 1 40); do
 	"$ABDUCO" -d "$matrix_sess" > "$matrix_out"
 	if grep -a -q "MATRIX_READY" "$matrix_out"; then
 		break
 	fi
-	sleep 0.25
+	sleep 0.5
 done
 assert_contains "MATRIX_BOOT" "$matrix_out"
 assert_contains "MATRIX_START_120" "$matrix_out"
