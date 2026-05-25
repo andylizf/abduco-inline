@@ -516,6 +516,19 @@ done
 assert_contains "DETACH_DRAIN_08000" "$tmpdir/detach-drain.out"
 pass "detached session (-n) drains pty without client"
 
+run "default command uses SHELL when no command given"
+defcmd_sess="$prefix-defcmd"
+# Create a session with no explicit command; the server should fall back to
+# $SHELL. Override SHELL to a known value so we can verify.
+SHELL=/bin/sh "$ABDUCO" -n "$defcmd_sess"
+sleep 0.3
+# Send a command into the shell to prove it's an interactive shell session.
+"$ABDUCO" -K -x "$defcmd_sess" $'echo DEFAULT_SHELL_OK\n'
+sleep 0.3
+"$ABDUCO" -d -L 20 "$defcmd_sess" > "$tmpdir/defcmd.out"
+assert_contains "DEFAULT_SHELL_OK" "$tmpdir/defcmd.out"
+pass "default command uses SHELL when no command given"
+
 run "no alt-screen escapes from attach dump send"
 sess="$prefix-alt"
 script_out="$tmpdir/attach.script"
