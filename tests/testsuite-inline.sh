@@ -564,6 +564,11 @@ os.close(master_fd)
 sys.stdout.buffer.write(buf)
 PYEOF
 assert_no_alt_screen "$script_out"
+# Attach must clear the visible screen before replaying history so the
+# replay does not visually interleave with pre-existing terminal content.
+if ! LC_ALL=C grep -a $'\033\[2J' "$script_out" >/dev/null; then
+	fail "attach output missing clear-screen (ESC[2J) sequence in $script_out"
+fi
 start_shell "$sess-dump" 'printf "ALT_DUMP_OK\n"'
 "$ABDUCO" -d "$sess-dump" > "$dump_out"
 "$ABDUCO" -K "$sess-dump" "echo ALT_KEY_OK" Enter > "$key_out"
