@@ -1519,7 +1519,7 @@ impl RawMode {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term);
         }
-        print!("\x1b[H");
+        print!("\x1b[2J\x1b[H");
         let _ = io::stdout().flush();
         Ok(Self { saved: Some(saved) })
     }
