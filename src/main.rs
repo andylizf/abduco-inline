@@ -473,7 +473,10 @@ fn command_args(opts: &Opts) -> io::Result<Vec<String>> {
     if let Ok(cmd) = env::var("ABDUCO_CMD") {
         return Ok(vec!["/bin/sh".into(), "-c".into(), cmd]);
     }
-    Ok(vec!["dvtm".into()])
+    if let Ok(shell) = env::var("SHELL") {
+        return Ok(vec![shell]);
+    }
+    Ok(vec!["/bin/sh".into()])
 }
 
 fn socket_path(name: &str) -> io::Result<PathBuf> {
