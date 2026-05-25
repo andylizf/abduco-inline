@@ -351,7 +351,7 @@ fn real_main() -> io::Result<()> {
     let name = opts.name.clone().ok_or_else(usage_err)?;
 
     match action {
-        Action::Create => create_session(&name, command_args(&opts)?, false, &opts),
+        Action::Create => create_session(&name, command_args(&opts)?, true, &opts),
         Action::CreateAttach => {
             create_session(&name, command_args(&opts)?, true, &opts)?;
             attach_session(&name, true, &opts)

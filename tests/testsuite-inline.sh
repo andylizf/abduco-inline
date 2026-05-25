@@ -488,6 +488,34 @@ if "$ABDUCO" -d -N 10 -L 2 "$sess" >/dev/null 2>&1; then
 fi
 pass "invalid dump tail option combination fails"
 
+run "detached session (-n) drains pty without client"
+detach_sess="$prefix-detach-drain"
+# Produce >64 KB of output (enough to fill the PTY kernel buffer) so that the
+# command would block if the server did not read the PTY master.
+"$ABDUCO" -n "$detach_sess" sh -c 'i=1
+while [ "$i" -le 8000 ]; do
+    printf "DETACH_DRAIN_%05d\n" "$i"
+    i=$((i + 1))
+done
+printf "DETACH_DRAIN_DONE\n"
+exec sh'
+# Wait for the producer to finish — if read_pty is false, the command blocks
+# at ~64 KB and DETACH_DRAIN_DONE never appears.
+deadline=$((SECONDS + 15))
+ready=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.3
+    if "$ABDUCO" -d "$detach_sess" 2>/dev/null > "$tmpdir/detach-drain.out"; then
+        if grep -a -q "DETACH_DRAIN_DONE" "$tmpdir/detach-drain.out"; then
+            ready=1
+            break
+        fi
+    fi
+done
+[ "$ready" -eq 1 ] || fail "detached session blocked; DETACH_DRAIN_DONE never appeared (read_pty not set for -n)"
+assert_contains "DETACH_DRAIN_08000" "$tmpdir/detach-drain.out"
+pass "detached session (-n) drains pty without client"
+
 run "no alt-screen escapes from attach dump send"
 sess="$prefix-alt"
 script_out="$tmpdir/attach.script"
